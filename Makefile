@@ -13,3 +13,6 @@ run:
 
 benchmark:
 	ulimit -n 65535 && k6 run benchmarks/10k_connections.js
+
+publish:
+	cargo publish --dry-run
