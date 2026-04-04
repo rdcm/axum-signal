@@ -3,15 +3,15 @@ resolver = "2"
 members = ["axum-signal", "examples/broadcast", "examples/custom_codec"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["rdcm@protonmail.ch"]
 license = "MIT"
 readme = "README.md"
 keywords = ["axum", "websocket", "broadcast", "realtime", "hub"]
-repository = "https://github.com/rdcm/clickhouse-testing"
+repository = "https://github.com/rdcm/axum-signal"
 rust-version = "1.94.0"
-description = "A crate that simplifies writing integration tests for ClickHouse, inspired by sqlx."
+description = "SignalR-inspired WebSocket hub abstraction for Axum — broadcast, unicast, JSON/Binary codecs. Passes 10k connections tests."
 categories = ["web-programming::websocket", "network-programming"]
 
 [workspace.dependencies]
