@@ -2,6 +2,18 @@
 resolver = "2"
 members = ["axum-signal", "examples/broadcast", "examples/custom_codec"]
 
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["rdcm@protonmail.ch"]
+license = "MIT"
+readme = "README.md"
+keywords = ["axum", "websocket", "broadcast", "realtime", "hub"]
+repository = "https://github.com/rdcm/clickhouse-testing"
+rust-version = "1.94.0"
+description = "A crate that simplifies writing integration tests for ClickHouse, inspired by sqlx."
+categories = ["web-programming::websocket", "network-programming"]
+
 [workspace.dependencies]
 anyhow = "1.0.102"
 axum = { version = "0.8.8", features = ["multipart", "macros", "ws"] }
