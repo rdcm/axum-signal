@@ -19,7 +19,7 @@ Or directly from GitHub:
 
 ```toml
 [dependencies]
-axum-signal = { git = "https://github.com/yourname/axum-signal" }
+axum-signal = { git = "https://github.com/rdcm/axum-signal" }
 ```
 
 ## Quick Start
