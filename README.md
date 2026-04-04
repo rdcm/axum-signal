@@ -12,7 +12,7 @@ You define your message types and handle logic. The library handles everything e
 
 ```toml
 [dependencies]
-axum-signal = "0.1"
+axum-signal = "0.1.1"
 ```
 
 Or directly from GitHub:
