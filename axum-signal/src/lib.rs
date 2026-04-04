@@ -10,13 +10,21 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::time::{interval, timeout};
 use uuid::Uuid;
 
+/// Configuration for a [`WsHub`] instance.
+///
+/// Controls connection health parameters such as idle timeout and heartbeat cadence.
 #[derive(Clone)]
 pub struct WsHubConfig {
+    /// How long a connection may remain idle (no incoming messages) before it is dropped.
     pub idle_timeout: Duration,
+    /// Interval between outgoing WebSocket ping frames used to keep the connection alive.
     pub heartbeat_interval: Duration,
 }
 
 impl Default for WsHubConfig {
+    /// Returns a `WsHubConfig` with sensible production defaults:
+    /// - `idle_timeout`: 60 seconds
+    /// - `heartbeat_interval`: 15 seconds
     fn default() -> Self {
         Self {
             idle_timeout: Duration::from_secs(60),
@@ -28,6 +36,13 @@ impl Default for WsHubConfig {
 static CLIENT_REGISTRY: OnceLock<DashMap<TypeId, Box<dyn std::any::Any + Send + Sync>>> =
     OnceLock::new();
 
+/// Returns the shared [`InMemoryWsClients`] instance for hub type `H`.
+///
+/// The registry is a global `DashMap` keyed by [`TypeId`]. On the first call for a given `H`
+/// the entry is created; subsequent calls return the same `Arc`-wrapped value.
+///
+/// Returns `None` only when the downcast fails, which should never happen in practice because
+/// the entry is always inserted with the correct concrete type.
 fn get_clients<H: WsHub>() -> Option<Arc<InMemoryWsClients<H::OutMessage, H::Codec>>> {
     let registry = CLIENT_REGISTRY.get_or_init(DashMap::new);
     let type_id = TypeId::of::<H>();
@@ -45,14 +60,33 @@ fn get_clients<H: WsHub>() -> Option<Arc<InMemoryWsClients<H::OutMessage, H::Cod
 
 // --- Codec ---
 
+/// Encodes and decodes WebSocket messages for a specific wire format.
+///
+/// Implement this trait to support custom serialization formats (e.g. MessagePack, Protobuf).
+/// Two built-in implementations are provided: [`JsonCodec`] and [`BinaryCodec`].
 pub trait WsCodec: Send + Sync + 'static {
+    /// Deserializes a WebSocket [`Message`] into `T`.
+    ///
+    /// Returns an error if the message type is not supported by this codec or if
+    /// deserialization fails.
     fn decode<T: serde::de::DeserializeOwned>(msg: Message) -> anyhow::Result<T>;
+
+    /// Serializes `msg` into a WebSocket [`Message`].
+    ///
+    /// Returns an error if serialization fails.
     fn encode<T: serde::Serialize>(msg: T) -> anyhow::Result<Message>;
 }
 
+/// A [`WsCodec`] that serializes messages as JSON text frames.
+///
+/// `decode` accepts both `Text` and `Binary` frames (the binary variant is parsed as UTF-8 JSON).
+/// `encode` always produces `Text` frames.
 pub struct JsonCodec;
 
 impl WsCodec for JsonCodec {
+    /// Deserializes `msg` from a JSON text or binary WebSocket frame into `T`.
+    ///
+    /// Returns an error for any other frame variant (e.g. `Ping`, `Pong`, `Close`).
     fn decode<T: serde::de::DeserializeOwned>(msg: Message) -> anyhow::Result<T> {
         match msg {
             Message::Text(text) => Ok(serde_json::from_str(&text)?),
@@ -61,14 +95,21 @@ impl WsCodec for JsonCodec {
         }
     }
 
+    /// Serializes `value` to a JSON string and wraps it in a `Text` WebSocket frame.
     fn encode<T: serde::Serialize>(value: T) -> anyhow::Result<Message> {
         Ok(Message::text(serde_json::to_string(&value)?))
     }
 }
 
+/// A [`WsCodec`] that serializes messages as binary frames using [`postcard`].
+///
+/// Both `decode` and `encode` operate exclusively on `Binary` WebSocket frames.
 pub struct BinaryCodec;
 
 impl WsCodec for BinaryCodec {
+    /// Deserializes `msg` from a binary WebSocket frame using `postcard`.
+    ///
+    /// Returns an error if the frame is not a `Binary` variant.
     fn decode<T: serde::de::DeserializeOwned>(msg: Message) -> anyhow::Result<T> {
         match msg {
             Message::Binary(data) => Ok(postcard::from_bytes(&data)?),
@@ -76,6 +117,7 @@ impl WsCodec for BinaryCodec {
         }
     }
 
+    /// Serializes `value` with `postcard` and wraps the result in a `Binary` WebSocket frame.
     fn encode<T: serde::Serialize>(value: T) -> anyhow::Result<Message> {
         Ok(Message::binary(postcard::to_stdvec(&value)?))
     }
@@ -83,27 +125,58 @@ impl WsCodec for BinaryCodec {
 
 // --- WsClients ---
 
+/// Manages the set of active WebSocket connections for a hub.
+///
+/// Each connection is identified by a unique string `connection_id`. The trait provides
+/// both unicast (point-to-point) and broadcast (one-to-all) delivery, encoded via codec `C`.
 pub trait WsClients<M, C>: Send + Sync + 'static
 where
     M: serde::Serialize + Send + Sync + 'static,
     C: WsCodec,
 {
+    /// Registers a new connection with the given `connection_id` and outgoing message `sender`.
+    ///
+    /// The `sender` is an `mpsc` channel half that forwards encoded frames to the connection's
+    /// writer task.
     fn add(&self, connection_id: Arc<str>, sender: mpsc::Sender<Message>) -> BoxFuture<'_, ()>;
+
+    /// Removes the connection identified by `connection_id` from the registry.
+    ///
+    /// After this call, unicast messages addressed to `connection_id` will be silently dropped.
     fn remove<'a>(&'a self, connection_id: &'a str) -> BoxFuture<'a, ()>;
+
+    /// Returns a new [`broadcast::Receiver`] that will receive all future broadcast messages.
+    ///
+    /// Each connection should call this once during setup to avoid missing early broadcasts.
     fn subscribe(&self) -> broadcast::Receiver<Message>;
+
+    /// Encodes `msg` and sends it only to the connection identified by `connection_id`.
+    ///
+    /// If the connection no longer exists or the channel is full the message is silently dropped.
     fn unicast<'a>(&'a self, connection_id: &'a str, msg: M) -> BoxFuture<'a, ()>;
+
+    /// Encodes `msg` and delivers it to **all** currently subscribed connections in O(1).
+    ///
+    /// Uses the internal `broadcast` channel; receivers that lag beyond the channel capacity
+    /// will observe a [`broadcast::error::RecvError::Lagged`] error.
     fn broadcast(&self, msg: M) -> BoxFuture<'_, ()>;
 }
 
+/// In-memory implementation of [`WsClients`].
+///
+/// Stores per-connection `mpsc` senders for unicast delivery and a single
+/// `broadcast` channel for fan-out delivery. Both channels hold pre-encoded
+/// [`Message`] values so encoding happens once regardless of the number of receivers.
 pub struct InMemoryWsClients<M, C> {
-    // для unicast — mpsc sender на каждое соединение
+    // mpsc sender per connection — used for unicast
     unicast_senders: DashMap<String, mpsc::Sender<Message>>,
-    // для broadcast — один канал на всех
+    // single broadcast channel shared by all connections
     broadcast_tx: broadcast::Sender<Message>,
     _phantom: std::marker::PhantomData<(M, C)>,
 }
 
 impl<M, C> Default for InMemoryWsClients<M, C> {
+    /// Creates an empty `InMemoryWsClients` with a broadcast channel capacity of 1024 messages.
     fn default() -> Self {
         let (broadcast_tx, _) = broadcast::channel(1024);
         Self {
@@ -119,6 +192,7 @@ where
     M: serde::Serialize + Send + Sync + 'static,
     C: WsCodec,
 {
+    /// Inserts `sender` into the unicast map under `connection_id`.
     fn add(&self, connection_id: Arc<str>, sender: mpsc::Sender<Message>) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             self.unicast_senders
@@ -126,16 +200,22 @@ where
         })
     }
 
+    /// Removes the entry for `connection_id` from the unicast map.
     fn remove<'a>(&'a self, connection_id: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             self.unicast_senders.remove(connection_id);
         })
     }
 
+    /// Subscribes to the internal broadcast channel, returning a new receiver.
     fn subscribe(&self) -> broadcast::Receiver<Message> {
         self.broadcast_tx.subscribe()
     }
 
+    /// Encodes `msg` with codec `C` and sends the resulting frame to the connection
+    /// identified by `connection_id` via its `mpsc` sender.
+    ///
+    /// Encoding errors are logged at `error` level; missing or full channels are silently ignored.
     fn unicast<'a>(&'a self, connection_id: &'a str, msg: M) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             match C::encode(msg) {
@@ -149,11 +229,15 @@ where
         })
     }
 
+    /// Encodes `msg` with codec `C` and publishes the resulting frame to the broadcast channel.
+    ///
+    /// This is an O(1) operation: the frame is sent once and all active receivers retrieve it
+    /// independently. Encoding errors are logged at `error` level.
     fn broadcast(&self, msg: M) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             match C::encode(msg) {
                 Ok(ws_msg) => {
-                    // O(1) — один send, все подписчики получат сами
+                    // O(1) — single send; all subscribers receive independently
                     let _ = self.broadcast_tx.send(ws_msg);
                 }
                 Err(e) => tracing::error!("encode error: {e}"),
@@ -164,21 +248,30 @@ where
 
 // --- Requests ---
 
+/// Carries context for a new WebSocket connection event.
 pub struct ConnectionRequest {
+    /// Unique identifier assigned to this connection (UUID v4).
     pub connection_id: Arc<str>,
 }
 
+/// Carries context for a WebSocket disconnection event.
 pub struct DisconnectRequest {
+    /// Unique identifier of the connection that was closed.
     pub connection_id: Arc<str>,
 }
 
 // --- MessageContext ---
 
+/// Provides message-sending capabilities to a hub's `on_message` handler.
+///
+/// `MessageContext` is created per incoming message and gives the handler access to both
+/// unicast (reply to sender) and broadcast (fan-out to all) delivery.
 pub struct MessageContext<M, C>
 where
     M: serde::Serialize + Send + Sync + 'static,
     C: WsCodec,
 {
+    /// The connection ID of the client that sent the triggering message.
     pub connection_id: Arc<str>,
     clients: Arc<dyn WsClients<M, C>>,
 }
@@ -188,10 +281,12 @@ where
     M: serde::Serialize + Send + Sync + 'static,
     C: WsCodec,
 {
+    /// Sends `msg` only to the connection that triggered the current handler invocation.
     pub async fn unicast(&self, msg: M) {
         self.clients.unicast(&self.connection_id, msg).await;
     }
 
+    /// Sends `msg` to **all** active connections, including the sender.
     pub async fn broadcast(&self, msg: M) {
         self.clients.broadcast(msg).await;
     }
@@ -199,23 +294,45 @@ where
 
 // --- WsHub ---
 
+/// The core trait for defining WebSocket hub behaviour.
+///
+/// Implement `WsHub` to handle connection lifecycle events and incoming messages.
+/// The hub is run by [`serve_hub`] or [`serve_hub_with_clients`].
+///
+/// # Associated types
+/// - `Codec` — wire format used for encoding/decoding messages.
+/// - `InMessage` — deserialized type of incoming client messages.
+/// - `OutMessage` — type of messages sent back to clients.
 pub trait WsHub: Send + Sync + 'static {
+    /// The codec used to encode outgoing messages and decode incoming ones.
     type Codec: WsCodec;
+    /// The Rust type that incoming WebSocket frames are deserialized into.
     type InMessage: serde::de::DeserializeOwned + Send;
+    /// The Rust type of messages sent to clients (via unicast or broadcast).
     type OutMessage: serde::Serialize + Send + Sync + 'static;
 
+    /// Called once when a new WebSocket connection is established.
+    ///
+    /// The default implementation logs the connection ID at `info` level.
     fn on_connect(&self, req: ConnectionRequest) -> impl Future<Output = ()> + Send {
         async move {
             tracing::info!("connected: {}", req.connection_id);
         }
     }
 
+    /// Called once after a WebSocket connection has been fully torn down.
+    ///
+    /// The default implementation logs the connection ID at `info` level.
     fn on_disconnect(&self, req: DisconnectRequest) -> impl Future<Output = ()> + Send {
         async move {
             tracing::info!("disconnected: {}", req.connection_id);
         }
     }
 
+    /// Called for every successfully decoded incoming message.
+    ///
+    /// `ctx` exposes `unicast` and `broadcast` helpers so the handler can reply to
+    /// the sender or push updates to all connected clients.
     fn on_message(
         &self,
         req: Self::InMessage,
@@ -225,6 +342,15 @@ pub trait WsHub: Send + Sync + 'static {
 
 // --- serve_hub ---
 
+/// Drives a WebSocket connection using the global in-memory client registry.
+///
+/// This is the high-level entry point. It looks up (or lazily creates) the shared
+/// [`InMemoryWsClients`] for hub type `H` and then delegates to [`serve_hub_with_clients`]
+/// with the default [`WsHubConfig`].
+///
+/// # Errors
+/// If the global registry entry cannot be downcast (which should never happen), the connection
+/// is dropped and an error is logged.
 pub async fn serve_hub<H>(socket: WebSocket, hub: H)
 where
     H: WsHub,
@@ -237,6 +363,24 @@ where
     }
 }
 
+/// Drives a single WebSocket connection end-to-end using the provided `clients` store and `config`.
+///
+/// This function is the core connection loop. It:
+/// 1. Splits the socket into a sink (writer) and stream (reader).
+/// 2. Assigns a UUID v4 `connection_id` and registers the connection with `clients`.
+/// 3. Spawns a writer task that forwards both unicast and broadcast [`Message`]s to the socket.
+/// 4. Calls [`WsHub::on_connect`].
+/// 5. Enters a read loop that:
+///    - Enforces `config.idle_timeout` on every receive operation.
+///    - Sends periodic `Ping` frames at `config.heartbeat_interval` and replies to `Ping` frames with `Pong`.
+///    - Decodes data frames with `H::Codec` and dispatches them to [`WsHub::on_message`] in a
+///      separate task, cancelled when the connection closes.
+/// 6. On loop exit: cancels the writer task, removes the connection from `clients`, and calls
+///    [`WsHub::on_disconnect`].
+///
+/// # Disconnect reasons (logged at `info` level)
+/// `"idle timeout"`, `"stream closed"`, `"read error"`, `"client closed"`,
+/// `"pong send error"`, `"ping send error"`.
 pub async fn serve_hub_with_clients<H, C>(
     socket: WebSocket,
     hub: H,
