@@ -57,18 +57,21 @@ impl WsHub for HelloHub {
 Wire it up in your Axum router:
 
 ```rust
-use axum::{Router, extract::{State, WebSocketUpgrade}, response::IntoResponse, routing::get};
-use axum_signal::serve_hub;
-
-pub fn router() -> Router<AppState> {
-    Router::new().route("/ws", get(handler))
+pub fn api_router(state: AppState) -> Router {
+    Router::new()
+        .merge(hello_router())
+        .with_state(state.clone())
 }
 
-async fn handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| serve_hub(socket, HelloHub::new(state)))
+pub fn hello_router() -> Router<AppState> {
+    Router::new().route(
+        "/ws",
+        get(
+            |ws: WebSocketUpgrade, State(state): State<AppState>| async move {
+                ws.on_upgrade(move |socket| serve_hub(socket, HelloHub::new(state)))
+            },
+        ),
+    )
 }
 ```
 
