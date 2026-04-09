@@ -249,7 +249,7 @@ where
 /// [`Message`] values so encoding happens once regardless of the number of receivers.
 pub struct InMemoryWsClients<M, C> {
     // mpsc sender per connection — used for unicast
-    unicast_senders: DashMap<String, mpsc::Sender<Message>>,
+    unicast_senders: DashMap<Arc<str>, mpsc::Sender<Message>>,
     // single broadcast channel shared by all connections
     broadcast_tx: broadcast::Sender<Message>,
     _phantom: std::marker::PhantomData<(M, C)>,
@@ -275,8 +275,7 @@ where
     /// Inserts `sender` into the unicast map under `connection_id`.
     fn add(&self, connection_id: Arc<str>, sender: mpsc::Sender<Message>) -> BoxFuture<'_, ()> {
         Box::pin(async move {
-            self.unicast_senders
-                .insert(connection_id.to_string(), sender);
+            self.unicast_senders.insert(connection_id, sender);
         })
     }
 
@@ -300,7 +299,10 @@ where
         Box::pin(async move {
             match C::encode(msg) {
                 Ok(ws_msg) => {
-                    if let Some(sender) = self.unicast_senders.get(connection_id) {
+                    // Clone the sender before dropping the DashMap guard — holding a DashMap Ref
+                    // across an `.await` keeps the shard's read lock live and causes contention.
+                    let sender = self.unicast_senders.get(connection_id).map(|r| r.clone());
+                    if let Some(sender) = sender {
                         let _ = sender.send(ws_msg).await;
                     }
                 }
@@ -581,7 +583,7 @@ where
                 }
             }
             _ = heartbeat.tick() => {
-                if heartbeat_tx.send(Message::Ping(vec![].into())).await.is_err() {
+                if heartbeat_tx.send(Message::Ping(axum::body::Bytes::new())).await.is_err() {
                     break "ping send error";
                 }
             }
