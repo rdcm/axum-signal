@@ -153,7 +153,9 @@ Tested with [k6](https://k6.io) on AMD Ryzen 9 (32 cores), 32GB RAM.
 ### Unicast - 10k connections
 
 ```
-        /\      Grafana   /‾‾/  
+ulimit -n 65535 && k6 run benchmarks/10k_connections.js
+
+         /\      Grafana   /‾‾/  
     /\  /  \     |\  __   /  /   
    /  \/    \    | |/ /  /   ‾‾\ 
   /          \   |   (  |  (‾)  |
@@ -161,18 +163,16 @@ Tested with [k6](https://k6.io) on AMD Ryzen 9 (32 cores), 32GB RAM.
 
 
      execution: local
-        script: ws_test.js
+        script: benchmarks/10k_connections.js
         output: -
 
      scenarios: (100.00%) 1 scenario, 10000 max VUs, 1m30s max duration (incl. graceful stop):
               * default: 10000 looping VUs for 1m0s (gracefulStop: 30s)
 
-WARN[0090] No script iterations fully finished, consider making the test duration longer 
-
 
   █ TOTAL RESULTS 
 
-    checks_total.......: 170000  1888.320672/s
+    checks_total.......: 170000  1888.350122/s
     checks_succeeded...: 100.00% 170000 out of 170000
     checks_failed......: 0.00%   0 out of 170000
 
@@ -183,14 +183,14 @@ WARN[0090] No script iterations fully finished, consider making the test duratio
     vus_max............: 10000  min=10000     max=10000
 
     NETWORK
-    data_received......: 4.1 MB 45 kB/s
-    data_sent..........: 5.4 MB 60 kB/s
+    data_received......: 5.4 MB 60 kB/s
+    data_sent..........: 6.8 MB 75 kB/s
 
     WEBSOCKET
-    ws_connecting......: avg=9.12ms min=32.57µs med=96.65µs max=130.43ms p(90)=20.95ms p(95)=68.57ms
-    ws_msgs_received...: 170000 1888.320672/s
-    ws_msgs_sent.......: 170000 1888.320672/s
-    ws_sessions........: 10000  111.077687/s
+    ws_connecting......: avg=156.49ms min=454.96µs med=137.77ms max=401.14ms p(90)=259.56ms p(95)=288.33ms
+    ws_msgs_received...: 170000 1888.350122/s
+    ws_msgs_sent.......: 170001 1888.36123/s
+    ws_sessions........: 10000  111.079419/s
 
 
 
@@ -202,8 +202,7 @@ default ✓ [======================================] 10000 VUs  1m0s
 ### Broadcast - 10k connections
 
 ```
-
-ulimit -n 65535 && k6 run ws_test.js
+ulimit -n 65535 && k6 run benchmarks/10k_connections.js
 
          /\      Grafana   /‾‾/  
     /\  /  \     |\  __   /  /   
@@ -213,20 +212,18 @@ ulimit -n 65535 && k6 run ws_test.js
 
 
      execution: local
-        script: ws_test.js
+        script: benchmarks/10k_connections.js
         output: -
 
      scenarios: (100.00%) 1 scenario, 10000 max VUs, 1m30s max duration (incl. graceful stop):
               * default: 10000 looping VUs for 1m0s (gracefulStop: 30s)
 
-WARN[0090] No script iterations fully finished, consider making the test duration longer 
-
 
   █ TOTAL RESULTS 
 
-    checks_total.......: 38676856 429435.867125/s
-    checks_succeeded...: 100.00%  38676856 out of 38676856
-    checks_failed......: 0.00%    0 out of 38676856
+    checks_total.......: 40295409 447473.026684/s
+    checks_succeeded...: 100.00%  40295409 out of 40295409
+    checks_failed......: 0.00%    0 out of 40295409
 
     ✓ got response
 
@@ -235,14 +232,14 @@ WARN[0090] No script iterations fully finished, consider making the test duratio
     vus_max............: 10000    min=10000       max=10000
 
     NETWORK
-    data_received......: 559 MB   6.2 MB/s
-    data_sent..........: 5.4 MB   60 kB/s
+    data_received......: 911 MB   10 MB/s
+    data_sent..........: 6.8 MB   75 kB/s
 
     WEBSOCKET
-    ws_connecting......: avg=17.86ms min=36.58µs med=129.39µs max=123.92ms p(90)=49.59ms p(95)=52.91ms
-    ws_msgs_received...: 38681727 429489.950686/s
-    ws_msgs_sent.......: 170000   1887.539603/s
-    ws_sessions........: 10000    111.031741/s
+    ws_connecting......: avg=155.42ms min=55.24ms med=143.95ms max=317.78ms p(90)=225.3ms p(95)=230.77ms
+    ws_msgs_received...: 40300506 447529.627922/s
+    ws_msgs_sent.......: 170000   1887.8184/s
+    ws_sessions........: 10000    111.048141/s
 
 
 
