@@ -1,13 +1,16 @@
 use axum::extract::ws::{Message, WebSocket};
 use dashmap::DashMap;
 use futures::future::BoxFuture;
+use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use std::any::TypeId;
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinHandle;
 use tokio::time::{interval, timeout};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Configuration for a [`WsHub`] instance.
@@ -442,18 +445,10 @@ where
 
 /// Drives a single WebSocket connection end-to-end using the provided `clients` store and `config`.
 ///
-/// This function is the core connection loop. It:
-/// 1. Splits the socket into a sink (writer) and stream (reader).
-/// 2. Assigns a UUID v4 `connection_id` and registers the connection with `clients`.
-/// 3. Spawns a writer task that forwards both unicast and broadcast [`Message`]s to the socket.
-/// 4. Calls [`WsHub::on_connect`].
-/// 5. Enters a read loop that:
-///    - Enforces `config.idle_timeout` on every receive operation.
-///    - Sends periodic `Ping` frames at `config.heartbeat_interval` and replies to `Ping` frames with `Pong`.
-///    - Decodes data frames with `H::Codec` and dispatches them to [`WsHub::on_message`] in a
-///      separate task, cancelled when the connection closes.
-/// 6. On loop exit: cancels the writer task, removes the connection from `clients`, and calls
-///    [`WsHub::on_disconnect`].
+/// Orchestrates connection setup and teardown:
+/// 1. Assigns a UUID v4 `connection_id` and registers the connection with `clients`.
+/// 2. Spawns a writer task via [`spawn_writer`].
+/// 3. Calls [`WsHub::on_connect`], runs [`run_read_loop`], then calls [`WsHub::on_disconnect`].
 ///
 /// # Disconnect reasons (logged at `info` level)
 /// `"idle timeout"`, `"stream closed"`, `"read error"`, `"client closed"`,
@@ -470,19 +465,56 @@ pub async fn serve_hub_with_clients<H, C>(
     let (sink, mut stream) = socket.split();
     let connection_id: Arc<str> = Uuid::new_v4().to_string().into();
 
-    let (unicast_tx, mut unicast_rx) = mpsc::channel::<Message>(32);
+    let (unicast_tx, unicast_rx) = mpsc::channel::<Message>(32);
     let heartbeat_tx = unicast_tx.clone();
-    let mut broadcast_rx = clients.subscribe();
+    let broadcast_rx = clients.subscribe();
+    let cancel = CancellationToken::new();
 
     clients.add(connection_id.clone(), unicast_tx).await;
 
     let hub = Arc::new(hub);
     let clients: Arc<dyn WsClients<H::OutMessage, H::Codec>> = clients;
-    let cancel = tokio_util::sync::CancellationToken::new();
+    let writer = spawn_writer(sink, unicast_rx, broadcast_rx, cancel.clone());
 
-    let writer_cancel = cancel.clone();
-    let writer = tokio::spawn(async move {
-        let mut sink = sink;
+    hub.on_connect(ConnectionRequest {
+        connection_id: connection_id.clone(),
+    })
+    .await;
+
+    let disconnect_reason = run_read_loop(
+        &mut stream,
+        &hub,
+        &clients,
+        &connection_id,
+        &cancel,
+        &heartbeat_tx,
+        config,
+    )
+    .await;
+
+    tracing::info!("connection {} closed: {}", connection_id, disconnect_reason);
+
+    cancel.cancel();
+    clients.remove(&connection_id).await;
+    writer.await.ok();
+
+    hub.on_disconnect(DisconnectRequest { connection_id }).await;
+}
+
+/// Spawns the writer task that forwards outgoing messages to the WebSocket sink.
+///
+/// Merges two sources into the sink:
+/// - `unicast_rx` — point-to-point messages addressed to this specific connection.
+/// - `broadcast_rx` — fan-out messages shared across all connections.
+///
+/// The task exits when `cancel` is triggered, either source closes, or a send error occurs.
+fn spawn_writer(
+    mut sink: SplitSink<WebSocket, Message>,
+    mut unicast_rx: mpsc::Receiver<Message>,
+    mut broadcast_rx: broadcast::Receiver<Message>,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
         loop {
             tokio::select! {
                 Some(msg) = unicast_rx.recv() => {
@@ -497,19 +529,35 @@ pub async fn serve_hub_with_clients<H, C>(
                         Err(_) => break,
                     }
                 }
-                _ = writer_cancel.cancelled() => break,
+                _ = cancel.cancelled() => break,
             }
         }
-    });
-
-    hub.on_connect(ConnectionRequest {
-        connection_id: connection_id.clone(),
     })
-    .await;
+}
 
+/// Runs the read loop for a single connection until it disconnects.
+///
+/// On each iteration:
+/// - Applies `config.idle_timeout` to the next incoming frame.
+/// - Sends a `Ping` frame every `config.heartbeat_interval`; resets the idle timer on any
+///   received frame.
+/// - Delegates each received frame to [`handle_frame`].
+///
+/// Returns the disconnect reason string, which is logged by the caller.
+async fn run_read_loop<H>(
+    stream: &mut SplitStream<WebSocket>,
+    hub: &Arc<H>,
+    clients: &Arc<dyn WsClients<H::OutMessage, H::Codec>>,
+    connection_id: &Arc<str>,
+    cancel: &CancellationToken,
+    heartbeat_tx: &mpsc::Sender<Message>,
+    config: &WsHubConfig,
+) -> &'static str
+where
+    H: WsHub,
+{
     let mut heartbeat = interval(config.heartbeat_interval);
-
-    let disconnect_reason = loop {
+    loop {
         tokio::select! {
             result = timeout(config.idle_timeout, stream.next()) => {
                 match result {
@@ -524,35 +572,10 @@ pub async fn serve_hub_with_clients<H, C>(
                     }
                     Ok(Some(Ok(msg))) => {
                         heartbeat.reset();
-                        match msg {
-                            Message::Close(_) => break "client closed",
-                            Message::Ping(p) => {
-                                if heartbeat_tx.send(Message::Pong(p)).await.is_err() {
-                                    break "pong send error";
-                                }
-                            }
-                            Message::Pong(_) => {}
-                            raw => match H::Codec::decode::<H::InMessage>(raw) {
-                                Err(e) => {
-                                    tracing::warn!("failed to parse message from {}: {e:?}", connection_id);
-                                }
-                                Ok(req) => {
-                                    let hub = hub.clone();
-                                    let cancel = cancel.clone();
-                                    let ctx = MessageContext {
-                                        connection_id: connection_id.clone(),
-                                        clients: clients.clone(),
-                                    };
-                                    tokio::spawn(async move {
-                                        tokio::select! {
-                                            _ = hub.on_message(req, ctx) => {}
-                                            _ = cancel.cancelled() => {
-                                                tracing::debug!("on_message cancelled");
-                                            }
-                                        }
-                                    });
-                                }
-                            },
+                        if let Some(reason) =
+                            handle_frame::<H>(msg, hub, clients, connection_id, cancel, heartbeat_tx).await
+                        {
+                            break reason;
                         }
                     }
                 }
@@ -563,13 +586,57 @@ pub async fn serve_hub_with_clients<H, C>(
                 }
             }
         }
-    };
+    }
+}
 
-    tracing::info!("connection {} closed: {}", connection_id, disconnect_reason);
-
-    cancel.cancel();
-    clients.remove(&connection_id).await;
-    writer.await.ok();
-
-    hub.on_disconnect(DisconnectRequest { connection_id }).await;
+/// Handles a single incoming WebSocket frame.
+///
+/// Returns `Some(reason)` to signal that the connection should be closed, or `None` to continue
+/// the read loop. Data frames are decoded and dispatched to [`WsHub::on_message`] in a separate
+/// task that is cancelled when `cancel` fires.
+async fn handle_frame<H>(
+    msg: Message,
+    hub: &Arc<H>,
+    clients: &Arc<dyn WsClients<H::OutMessage, H::Codec>>,
+    connection_id: &Arc<str>,
+    cancel: &CancellationToken,
+    heartbeat_tx: &mpsc::Sender<Message>,
+) -> Option<&'static str>
+where
+    H: WsHub,
+{
+    match msg {
+        Message::Close(_) => Some("client closed"),
+        Message::Ping(p) => {
+            if heartbeat_tx.send(Message::Pong(p)).await.is_err() {
+                Some("pong send error")
+            } else {
+                None
+            }
+        }
+        Message::Pong(_) => None,
+        raw => match H::Codec::decode::<H::InMessage>(raw) {
+            Err(e) => {
+                tracing::warn!("failed to parse message from {}: {e:?}", connection_id);
+                None
+            }
+            Ok(req) => {
+                let hub = hub.clone();
+                let cancel = cancel.clone();
+                let ctx = MessageContext {
+                    connection_id: connection_id.clone(),
+                    clients: clients.clone(),
+                };
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = hub.on_message(req, ctx) => {}
+                        _ = cancel.cancelled() => {
+                            tracing::debug!("on_message cancelled");
+                        }
+                    }
+                });
+                None
+            }
+        },
+    }
 }
