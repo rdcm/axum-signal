@@ -75,6 +75,25 @@ pub fn hello_router() -> Router<AppState> {
 }
 ```
 
+To pass data from Axum extractors into your hub:
+```rust
+pub fn hello_router() -> Router<AppState> {
+    Router::new().route(
+        "/ws",
+        get(
+            |ws: WebSocketUpgrade,
+             State(state): State<AppState>,
+             Query(params): Query<WsQueryParams>| async move {
+                // Extractors are resolved here, before the upgrade.
+                // Pass the extracted data into the hub constructor.
+                ws.on_upgrade(move |socket| serve_hub(socket, HelloHub::new(state, params)))
+            },
+        ),
+    )
+}
+```
+
+
 That's it. No connection management, no heartbeat setup, no serialization boilerplate.
 
 ## Features

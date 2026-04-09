@@ -235,7 +235,6 @@ dependencies = [
 name = "custom_codec"
 version = "0.1.1"
 dependencies = [
- "anyhow",
  "axum",
  "axum-signal",
  "rmp-serde",
