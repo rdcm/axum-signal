@@ -110,7 +110,7 @@ type Codec = JsonCodec;
 type Codec = BinaryCodec;
 ```
 
-**Broadcast and unicast** - send to all connected clients or just one:
+**Broadcast, unicast, groups** - flexible targeting:
 
 ```rust
 async fn on_message(&self, msg: MyMessage, ctx: MessageContext<MyReply, JsonCodec>) {
@@ -118,7 +118,23 @@ async fn on_message(&self, msg: MyMessage, ctx: MessageContext<MyReply, JsonCode
     ctx.broadcast(MyReply::Ok(msg.text.clone())).await;
 
     // to sender only
-    ctx.unicast(MyReply::Ok(msg.text)).await;
+    ctx.unicast(MyReply::Ok(msg.text.clone())).await;
+
+    // to all except specific connections
+    ctx.broadcast_except(&["conn-id-1", "conn-id-2"], MyReply::Ok(msg.text.clone())).await;
+
+    // group management
+    ctx.add_to_group("room-1").await;
+    ctx.remove_from_group("room-1").await;
+
+    // to all in a group
+    ctx.broadcast_group("room-1", MyReply::Ok(msg.text.clone())).await;
+
+    // to a group except specific connections
+    ctx.broadcast_group_except("room-1", &["conn-id-1"], MyReply::Ok(msg.text.clone())).await;
+
+    // to all in multiple groups (each connection receives at most once)
+    ctx.broadcast_groups(&["room-1", "room-2"], MyReply::Ok(msg.text)).await;
 }
 ```
 
@@ -248,8 +264,3 @@ running (1m30.1s), 00000/10000 VUs, 0 complete and 10000 interrupted iterations
 default ✓ [======================================] 10000 VUs  1m0s
 ```
 
-## TODO
-
-- `broaddcast_except` - broadcast to all connections excluding specific connection
-- `broadcast_group` - broadcast to a named group of connections
-- `broadcast_group_except` - broadcast to a group excluding specific connection

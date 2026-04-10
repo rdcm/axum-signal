@@ -1,5 +1,5 @@
 use axum::extract::ws::{Message, WebSocket};
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use futures::future::BoxFuture;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
@@ -240,6 +240,32 @@ where
     /// Uses the internal `broadcast` channel; receivers that lag beyond the channel capacity
     /// will observe a [`broadcast::error::RecvError::Lagged`] error.
     fn broadcast(&self, msg: M) -> BoxFuture<'_, ()>;
+
+    /// Encodes `msg` and sends it to all connections **except** those listed in `excluded`.
+    fn broadcast_except<'a>(&'a self, excluded: &'a [&'a str], msg: M) -> BoxFuture<'a, ()>;
+
+    /// Adds `connection_id` to the named `group`.
+    fn add_to_group<'a>(&'a self, connection_id: &'a str, group: &'a str) -> BoxFuture<'a, ()>;
+
+    /// Removes `connection_id` from the named `group`.
+    fn remove_from_group<'a>(&'a self, connection_id: &'a str, group: &'a str)
+    -> BoxFuture<'a, ()>;
+
+    /// Encodes `msg` and sends it to all connections in `group`.
+    fn broadcast_group<'a>(&'a self, group: &'a str, msg: M) -> BoxFuture<'a, ()>;
+
+    /// Encodes `msg` and sends it to all connections in `group` except those in `excluded`.
+    fn broadcast_group_except<'a>(
+        &'a self,
+        group: &'a str,
+        excluded: &'a [&'a str],
+        msg: M,
+    ) -> BoxFuture<'a, ()>;
+
+    /// Encodes `msg` and sends it to all connections in any of the listed `groups`.
+    ///
+    /// Each connection receives the message at most once even if it belongs to multiple groups.
+    fn broadcast_groups<'a>(&'a self, groups: &'a [&'a str], msg: M) -> BoxFuture<'a, ()>;
 }
 
 /// In-memory implementation of [`WsClients`].
@@ -252,6 +278,10 @@ pub struct InMemoryWsClients<M, C> {
     unicast_senders: DashMap<Arc<str>, mpsc::Sender<Message>>,
     // single broadcast channel shared by all connections
     broadcast_tx: broadcast::Sender<Message>,
+    // group name -> set of connection ids
+    group_members: DashMap<Arc<str>, DashSet<Arc<str>>>,
+    // connection id -> set of group names (reverse index for cleanup on disconnect)
+    connection_groups: DashMap<Arc<str>, DashSet<Arc<str>>>,
     _phantom: std::marker::PhantomData<(M, C)>,
 }
 
@@ -262,6 +292,8 @@ impl<M, C> Default for InMemoryWsClients<M, C> {
         Self {
             unicast_senders: DashMap::new(),
             broadcast_tx,
+            group_members: DashMap::new(),
+            connection_groups: DashMap::new(),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -279,9 +311,16 @@ where
         })
     }
 
-    /// Removes the entry for `connection_id` from the unicast map.
+    /// Removes the entry for `connection_id` from the unicast map and all groups it belongs to.
     fn remove<'a>(&'a self, connection_id: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            if let Some((_, groups)) = self.connection_groups.remove(connection_id) {
+                for group in groups.iter() {
+                    if let Some(members) = self.group_members.get(group.as_ref()) {
+                        members.remove(connection_id);
+                    }
+                }
+            }
             self.unicast_senders.remove(connection_id);
         })
     }
@@ -321,6 +360,132 @@ where
                 Ok(ws_msg) => {
                     // O(1) — single send; all subscribers receive independently
                     let _ = self.broadcast_tx.send(ws_msg);
+                }
+                Err(e) => tracing::error!("encode error: {e}"),
+            }
+        })
+    }
+
+    fn broadcast_except<'a>(&'a self, excluded: &'a [&'a str], msg: M) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            match C::encode(msg) {
+                Ok(ws_msg) => {
+                    let senders: Vec<_> = self
+                        .unicast_senders
+                        .iter()
+                        .filter(|e| !excluded.contains(&e.key().as_ref()))
+                        .map(|e| e.value().clone())
+                        .collect();
+                    for sender in senders {
+                        let _ = sender.send(ws_msg.clone()).await;
+                    }
+                }
+                Err(e) => tracing::error!("encode error: {e}"),
+            }
+        })
+    }
+
+    fn add_to_group<'a>(&'a self, connection_id: &'a str, group: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let conn: Arc<str> = Arc::from(connection_id);
+            let grp: Arc<str> = Arc::from(group);
+            self.group_members
+                .entry(grp.clone())
+                .or_default()
+                .insert(conn.clone());
+            self.connection_groups.entry(conn).or_default().insert(grp);
+        })
+    }
+
+    fn remove_from_group<'a>(
+        &'a self,
+        connection_id: &'a str,
+        group: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            if let Some(members) = self.group_members.get(group) {
+                members.remove(connection_id);
+            }
+            if let Some(groups) = self.connection_groups.get(connection_id) {
+                groups.remove(group);
+            }
+        })
+    }
+
+    fn broadcast_group<'a>(&'a self, group: &'a str, msg: M) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            match C::encode(msg) {
+                Ok(ws_msg) => {
+                    let conn_ids: Vec<Arc<str>> = match self.group_members.get(group) {
+                        Some(members) => members.iter().map(|id| id.clone()).collect(),
+                        None => return,
+                    };
+                    let senders: Vec<_> = conn_ids
+                        .iter()
+                        .filter_map(|id| self.unicast_senders.get(id.as_ref()).map(|s| s.clone()))
+                        .collect();
+                    for sender in senders {
+                        let _ = sender.send(ws_msg.clone()).await;
+                    }
+                }
+                Err(e) => tracing::error!("encode error: {e}"),
+            }
+        })
+    }
+
+    fn broadcast_group_except<'a>(
+        &'a self,
+        group: &'a str,
+        excluded: &'a [&'a str],
+        msg: M,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            match C::encode(msg) {
+                Ok(ws_msg) => {
+                    let conn_ids: Vec<Arc<str>> = match self.group_members.get(group) {
+                        Some(members) => members
+                            .iter()
+                            .filter(|id| !excluded.contains(&id.as_ref()))
+                            .map(|id| id.clone())
+                            .collect(),
+                        None => return,
+                    };
+                    let senders: Vec<_> = conn_ids
+                        .iter()
+                        .filter_map(|id| self.unicast_senders.get(id.as_ref()).map(|s| s.clone()))
+                        .collect();
+                    for sender in senders {
+                        let _ = sender.send(ws_msg.clone()).await;
+                    }
+                }
+                Err(e) => tracing::error!("encode error: {e}"),
+            }
+        })
+    }
+
+    fn broadcast_groups<'a>(&'a self, groups: &'a [&'a str], msg: M) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            match C::encode(msg) {
+                Ok(ws_msg) => {
+                    use std::collections::HashSet;
+                    let mut seen: HashSet<Arc<str>> = HashSet::new();
+                    let mut senders: Vec<mpsc::Sender<Message>> = Vec::new();
+                    for group in groups {
+                        let conn_ids: Vec<Arc<str>> = match self.group_members.get(*group) {
+                            Some(members) => members.iter().map(|id| id.clone()).collect(),
+                            None => continue,
+                        };
+                        for id in conn_ids {
+                            if seen.insert(id.clone())
+                                && let Some(s) = self.unicast_senders.get(id.as_ref())
+                            {
+                                senders.push(s.clone());
+                            }
+                        }
+                    }
+                    for sender in senders {
+                        let _ = sender.send(ws_msg.clone()).await;
+                    }
                 }
                 Err(e) => tracing::error!("encode error: {e}"),
             }
@@ -371,6 +536,42 @@ where
     /// Sends `msg` to **all** active connections, including the sender.
     pub async fn broadcast(&self, msg: M) {
         self.clients.broadcast(msg).await;
+    }
+
+    /// Sends `msg` to all connections **except** those listed in `excluded`.
+    pub async fn broadcast_except(&self, excluded: &[&str], msg: M) {
+        self.clients.broadcast_except(excluded, msg).await;
+    }
+
+    /// Adds the current connection to the named `group`.
+    pub async fn add_to_group(&self, group: &str) {
+        self.clients.add_to_group(&self.connection_id, group).await;
+    }
+
+    /// Removes the current connection from the named `group`.
+    pub async fn remove_from_group(&self, group: &str) {
+        self.clients
+            .remove_from_group(&self.connection_id, group)
+            .await;
+    }
+
+    /// Sends `msg` to all connections in `group`.
+    pub async fn broadcast_group(&self, group: &str, msg: M) {
+        self.clients.broadcast_group(group, msg).await;
+    }
+
+    /// Sends `msg` to all connections in `group` except those listed in `excluded`.
+    pub async fn broadcast_group_except(&self, group: &str, excluded: &[&str], msg: M) {
+        self.clients
+            .broadcast_group_except(group, excluded, msg)
+            .await;
+    }
+
+    /// Sends `msg` to all connections in any of the listed `groups`.
+    ///
+    /// Each connection receives the message at most once even if it belongs to multiple groups.
+    pub async fn broadcast_groups(&self, groups: &[&str], msg: M) {
+        self.clients.broadcast_groups(groups, msg).await;
     }
 }
 
