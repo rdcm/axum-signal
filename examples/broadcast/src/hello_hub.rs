@@ -17,7 +17,11 @@ impl WsHub for HelloHub {
     type InMessage = HelloMessage;
     type OutMessage = HelloReply;
 
-    async fn on_message(&self, msg: HelloMessage, ctx: MessageContext<HelloReply, JsonCodec>) {
+    async fn on_message(
+        &self,
+        msg: Self::InMessage,
+        ctx: MessageContext<Self::OutMessage, Self::Codec>,
+    ) {
         ctx.broadcast(HelloReply::Ok(msg.text)).await
     }
 }
