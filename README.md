@@ -113,7 +113,7 @@ type Codec = BinaryCodec;
 **Broadcast, unicast, groups** - flexible targeting:
 
 ```rust
-async fn on_message(&self, msg: MyMessage, ctx: MessageContext<MyReply, JsonCodec>) {
+async fn on_message(&self, msg: Self::InMessage, ctx: MessageContext<Self::OutMessage, Self::Codec>) {
     // to all clients
     ctx.broadcast(MyReply::Ok(msg.text.clone())).await;
 
