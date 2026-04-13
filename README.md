@@ -156,7 +156,7 @@ impl WsHub for HelloHub {
         tracing::info!("disconnected: {}", req.connection_id);
     }
 
-    async fn on_message(&self, msg: HelloMessage, ctx: MessageContext<HelloReply, JsonCodec>) {
+    async fn on_message(&self, msg: Self::InMessage, ctx: MessageContext<Self::OutMessage, Self::Codec>) {
         ctx.unicast(HelloReply::Ok(msg.text)).await;
     }
 }
