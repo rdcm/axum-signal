@@ -101,6 +101,7 @@ dependencies = [
 name = "axum-signal"
 version = "0.1.1"
 dependencies = [
+ "anyhow",
  "axum",
  "dashmap",
  "futures",
@@ -111,6 +112,7 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

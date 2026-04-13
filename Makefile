@@ -8,6 +8,9 @@ format:
 lint:
 	cargo clippy --release --all-targets
 
+tests:
+	cargo nextest run --workspace --no-fail-fast
+
 run:
 	ulimit -n 65535 && ./target/release/broadcast
 
