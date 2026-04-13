@@ -11,6 +11,9 @@ rust-version = { workspace = true }
 description = { workspace = true }
 categories = { workspace = true }
 
+[features]
+client = ["dep:tokio-tungstenite"]
+
 [dependencies]
 axum = { workspace = true }
 dashmap = { workspace = true }
@@ -19,6 +22,7 @@ postcard = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tokio-tungstenite = { workspace = true, optional = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }

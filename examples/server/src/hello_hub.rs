@@ -1,6 +1,6 @@
 use crate::app_state::AppState;
-use crate::messages::{HelloMessage, HelloReply};
 use axum_signal::{JsonCodec, MessageContext, WsHub};
+use contracts::{HelloMessage, HelloReply};
 
 pub struct HelloHub {
     _state: AppState,

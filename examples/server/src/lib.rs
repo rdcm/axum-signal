@@ -4,8 +4,6 @@ pub mod app_config;
 pub mod app_state;
 #[path = "hello_hub.rs"]
 pub mod hello_hub;
-#[path = "messages.rs"]
-pub mod messages;
 #[path = "router.rs"]
 pub mod router;
 #[path = "service.rs"]

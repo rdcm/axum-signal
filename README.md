@@ -162,6 +162,48 @@ impl WsHub for HelloHub {
 }
 ```
 
+## Rust client
+
+Enable the `client` feature:
+
+```toml
+[dependencies]
+axum-signal = { version = "0.1.1", features = ["client"] }
+```
+
+`HubClient` mirrors the hub's type parameters — `S` is the message type sent to the server (`InMessage`), `R` is the message type received from the server (`OutMessage`), and `C` is the codec. All three must match the server hub.
+
+```rust
+use axum_signal::{HubClient, JsonCodec};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize)]
+pub struct HelloMessage {
+    pub text: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub enum HelloReply {
+    Ok(String),
+    Err(String),
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = HubClient::builder("ws://localhost:3000/ws")
+        .with_in_message::<HelloMessage>()
+        .with_out_message::<HelloReply>()
+        .with_codec::<JsonCodec>()
+        .build();
+
+    client.on_message(|reply: HelloReply| println!("{reply:?}"));
+    client.connect().await?;
+
+    client.send(HelloMessage { text: "hello".into() })?;
+    Ok(())
+}
+```
+
 ## Benchmarks
 
 Tested with [k6](https://k6.io) on AMD Ryzen 9 (32 cores), 32GB RAM.
