@@ -29,8 +29,7 @@ async fn main() -> Result<()> {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
 
-    // give the reader task a moment to flush incoming replies
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    client.disconnect().await;
 
     Ok(())
 }

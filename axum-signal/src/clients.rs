@@ -113,12 +113,18 @@ where
     }
 
     /// Removes the entry for `connection_id` from the unicast map and all groups it belongs to.
+    ///
+    /// Groups that become empty after the removal are also dropped from `group_members`.
     fn remove<'a>(&'a self, connection_id: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             if let Some((_, groups)) = self.connection_groups.remove(connection_id) {
                 for group in groups.iter() {
                     if let Some(members) = self.group_members.get(group.as_ref()) {
                         members.remove(connection_id);
+                        if members.is_empty() {
+                            drop(members);
+                            self.group_members.remove(group.as_ref());
+                        }
                     }
                 }
             }

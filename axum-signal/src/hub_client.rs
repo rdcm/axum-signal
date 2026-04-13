@@ -3,6 +3,7 @@ use futures::{SinkExt, StreamExt};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message as TungMessage};
 
 use crate::codec::WsCodec;
@@ -48,7 +49,7 @@ impl From<tokio_tungstenite::tungstenite::Error> for ClientError {
     }
 }
 
-/// Typestate builder for [`HubClient`]. Obtained via [`HubClient::new`].
+/// Typestate builder for [`HubClient`]. Obtained via [`HubClient::builder`].
 ///
 /// Use [`with_in_message`](Self::with_in_message), [`with_out_message`](Self::with_out_message),
 /// and [`with_codec`](Self::with_codec) to pin the type parameters, then call
@@ -101,6 +102,8 @@ where
             url: self.url,
             handler: None,
             tx: None,
+            writer: None,
+            reader: None,
             _phantom: PhantomData,
         }
     }
@@ -128,6 +131,7 @@ where
 /// client.connect().await?;
 ///
 /// client.send(HelloMessage { text: "hello".into() })?;
+/// client.disconnect().await;
 /// # Ok(())
 /// # }
 /// ```
@@ -135,7 +139,18 @@ pub struct HubClient<S = Unset, R = Unset, C = Unset> {
     url: String,
     handler: Option<Arc<dyn Fn(R) + Send + Sync + 'static>>,
     tx: Option<mpsc::UnboundedSender<TungMessage>>,
+    writer: Option<JoinHandle<()>>,
+    reader: Option<JoinHandle<()>>,
     _phantom: PhantomData<(S, C)>,
+}
+
+impl<S, R, C> Drop for HubClient<S, R, C> {
+    /// Sends a Close frame if [`disconnect`](HubClient::disconnect) was not called explicitly.
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(TungMessage::Close(None));
+        }
+    }
 }
 
 impl HubClient {
@@ -173,7 +188,7 @@ where
         let (tx, mut rx) = mpsc::unbounded_channel::<TungMessage>();
 
         // writer task: drains the outgoing channel into the WebSocket sink
-        tokio::spawn(async move {
+        let writer = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 if sink.send(msg).await.is_err() {
                     break;
@@ -183,7 +198,7 @@ where
 
         // reader task: decodes each incoming frame and calls the handler
         let handler = self.handler.clone();
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             while let Some(Ok(msg)) = stream.next().await {
                 if let Some(axum_msg) = tung_to_axum(msg) {
                     let Some(ref h) = handler else { continue };
@@ -196,7 +211,27 @@ where
         });
 
         self.tx = Some(tx);
+        self.writer = Some(writer);
+        self.reader = Some(reader);
         Ok(())
+    }
+
+    /// Performs a clean WebSocket closing handshake and waits for both background tasks to exit.
+    ///
+    /// Sends a Close frame, then blocks until the server echoes it back and the connection is
+    /// fully closed. After this returns, all in-flight messages have been flushed.
+    pub async fn disconnect(&mut self) {
+        // dropping tx closes the channel — writer task sends Close then exits
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(TungMessage::Close(None));
+        }
+        // wait for writer to flush, then for reader to receive the server's Close echo
+        if let Some(h) = self.writer.take() {
+            let _ = h.await;
+        }
+        if let Some(h) = self.reader.take() {
+            let _ = h.await;
+        }
     }
 
     /// Encodes `msg` and queues it for delivery to the server.

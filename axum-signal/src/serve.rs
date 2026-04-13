@@ -185,7 +185,7 @@ where
                     }
                     Ok(None) => break "stream closed",
                     Ok(Some(Err(e))) => {
-                        tracing::error!("ws read error on {}: {e}", connection_id);
+                        tracing::warn!("ws read error on {}: {e}", connection_id);
                         break "read error";
                     }
                     Ok(Some(Ok(msg))) => {
