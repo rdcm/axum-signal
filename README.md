@@ -200,9 +200,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     client.connect().await?;
 
     client.send(HelloMessage { text: "hello".into() })?;
+
+    // sends a Close frame and waits for the server to echo it back
+    client.disconnect().await;
     Ok(())
 }
 ```
+
+Calling `disconnect()` performs the WebSocket closing handshake — it sends a Close frame, waits for the writer task to flush it, then waits for the reader task to receive the server's Close response. This avoids the `Connection reset without closing handshake` warning on the server side.
+
+If `disconnect()` is not called, `Drop` will still send the Close frame on a best-effort basis, but without waiting for the handshake to complete.
 
 ## Benchmarks
 
