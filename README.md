@@ -12,7 +12,7 @@ You define your message types and handle logic. The library handles everything e
 
 ```toml
 [dependencies]
-axum-signal = "0.1.1"
+axum-signal = "0.1.2"
 ```
 
 Or directly from GitHub:
@@ -168,7 +168,7 @@ Enable the `client` feature:
 
 ```toml
 [dependencies]
-axum-signal = { version = "0.1.1", features = ["client"] }
+axum-signal = { version = "0.1.2", features = ["client"] }
 ```
 
 `HubClient` mirrors the hub's type parameters — `S` is the message type sent to the server (`InMessage`), `R` is the message type received from the server (`OutMessage`), and `C` is the codec. All three must match the server hub.
@@ -312,4 +312,3 @@ ulimit -n 65535 && k6 run benchmarks/10k_connections.js
 running (1m30.1s), 00000/10000 VUs, 0 complete and 10000 interrupted iterations
 default ✓ [======================================] 10000 VUs  1m0s
 ```
-

@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "axum-signal"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum-signal",
@@ -195,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "contracts"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
 ]
@@ -242,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "custom_codec"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "axum-signal",
@@ -995,7 +995,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
