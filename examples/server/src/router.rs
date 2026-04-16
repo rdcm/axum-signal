@@ -3,7 +3,7 @@ use crate::hello_hub::HelloHub;
 use axum::Router;
 use axum::extract::{State, WebSocketUpgrade};
 use axum::routing::get;
-use axum_signal::serve_hub;
+use axum_signal::{WsHubConfig, serve_hub};
 
 pub fn api_router(state: AppState) -> Router {
     Router::new()
@@ -16,7 +16,10 @@ pub fn hello_router() -> Router<AppState> {
         "/ws",
         get(
             |ws: WebSocketUpgrade, State(state): State<AppState>| async move {
-                ws.on_upgrade(move |socket| serve_hub(socket, HelloHub::new(state)))
+                let config = WsHubConfig::default();
+                ws.on_upgrade(move |socket| async move {
+                    serve_hub(socket, HelloHub::new(state), &config).await
+                })
             },
         ),
     )

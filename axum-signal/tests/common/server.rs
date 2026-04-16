@@ -3,7 +3,8 @@ use axum::extract::{State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum_signal::{
-    InMemoryWsClients, JsonCodec, MessageContext, WsHub, WsHubConfig, serve_hub_with_clients,
+    BroadcastPolicy, InMemoryWsClients, JsonCodec, MessageContext, WsHub, WsHubConfig,
+    serve_hub_with_clients,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -138,12 +139,17 @@ pub struct TestServer {
 }
 
 impl TestServer {
-    pub async fn start() -> anyhow::Result<Self> {
-        let clients = Arc::new(InMemoryWsClients::<TestReply, JsonCodec>::default());
-        let state = ServerState {
-            clients,
-            config: Arc::new(Default::default()),
-        };
+    /// Starts a server with a custom [`BroadcastPolicy`].
+    pub async fn start_with_policy(policy: BroadcastPolicy) -> anyhow::Result<Self> {
+        let config = Arc::new(WsHubConfig {
+            policy,
+            ..WsHubConfig::default()
+        });
+        let clients = Arc::new(InMemoryWsClients::<TestReply, JsonCodec>::new(
+            config.policy.clone(),
+            config.broadcast_channel_capacity,
+        ));
+        let state = ServerState { clients, config };
 
         let app = Router::new()
             .route("/ws", get(ws_handler))

@@ -4,6 +4,7 @@ use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use std::any::TypeId;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, timeout};
@@ -25,16 +26,19 @@ static CLIENT_REGISTRY: OnceLock<DashMap<TypeId, Box<dyn std::any::Any + Send + 
 ///
 /// Returns `None` only when the downcast fails, which should never happen in practice because
 /// the entry is always inserted with the correct concrete type.
-fn get_clients<H: WsHub>() -> Option<Arc<InMemoryWsClients<H::OutMessage, H::Codec>>> {
+fn get_clients<H: WsHub>(
+    config: &WsHubConfig,
+) -> Option<Arc<InMemoryWsClients<H::OutMessage, H::Codec>>> {
     let registry = CLIENT_REGISTRY.get_or_init(DashMap::new);
     let type_id = TypeId::of::<H>();
 
     registry
         .entry(type_id)
         .or_insert_with(|| {
-            Box::new(Arc::new(
-                InMemoryWsClients::<H::OutMessage, H::Codec>::default(),
-            ))
+            Box::new(Arc::new(InMemoryWsClients::<H::OutMessage, H::Codec>::new(
+                config.policy.clone(),
+                config.broadcast_channel_capacity,
+            )))
         })
         .downcast_ref::<Arc<InMemoryWsClients<H::OutMessage, H::Codec>>>()
         .cloned()
@@ -43,20 +47,18 @@ fn get_clients<H: WsHub>() -> Option<Arc<InMemoryWsClients<H::OutMessage, H::Cod
 /// Drives a WebSocket connection using the global in-memory client registry.
 ///
 /// This is the high-level entry point. It looks up (or lazily creates) the shared
-/// [`InMemoryWsClients`] for hub type `H` and then delegates to [`serve_hub_with_clients`]
-/// with the default [`WsHubConfig`].
+/// [`InMemoryWsClients`] for hub type `H` and then delegates to [`serve_hub_with_clients`].
+/// The policy from `config` is applied when the registry entry is first created.
 ///
 /// # Errors
 /// If the global registry entry cannot be downcast (which should never happen), the connection
 /// is dropped and an error is logged.
-pub async fn serve_hub<H>(socket: WebSocket, hub: H)
+pub async fn serve_hub<H>(socket: WebSocket, hub: H, config: &WsHubConfig)
 where
     H: WsHub,
 {
-    match get_clients::<H>() {
-        Some(clients) => {
-            serve_hub_with_clients(socket, hub, clients, &WsHubConfig::default()).await
-        }
+    match get_clients::<H>(config) {
+        Some(clients) => serve_hub_with_clients(socket, hub, clients, config).await,
         None => tracing::error!("failed to get clients registry for hub — connection dropped"),
     }
 }
@@ -83,14 +85,24 @@ pub async fn serve_hub_with_clients<H, C>(
     let (sink, mut stream) = socket.split();
     let connection_id: Arc<str> = Uuid::new_v4().to_string().into();
 
-    let (unicast_tx, unicast_rx) = mpsc::channel::<Message>(32);
+    let (unicast_tx, unicast_rx) = mpsc::channel::<Message>(config.unicast_channel_capacity);
     let heartbeat_tx = unicast_tx.clone();
     let broadcast_rx = clients.subscribe();
     let cancel = CancellationToken::new();
-
-    clients.add(connection_id.clone(), unicast_tx).await;
-
     let hub = Arc::new(hub);
+
+    let hub_for_drop = hub.clone();
+    clients
+        .add(
+            connection_id.clone(),
+            unicast_tx,
+            cancel.clone(),
+            Arc::new(move |id| {
+                let hub = hub_for_drop.clone();
+                tokio::spawn(async move { hub.on_message_drop(id).await });
+            }),
+        )
+        .await;
     let clients: Arc<dyn WsClients<H::OutMessage, H::Codec>> = clients;
     let writer = spawn_writer(sink, unicast_rx, broadcast_rx, cancel.clone());
 
@@ -175,6 +187,7 @@ where
     H: WsHub,
 {
     let mut heartbeat = interval(config.heartbeat_interval);
+    let mut ping_sent_at: Option<Instant> = None;
     loop {
         tokio::select! {
             result = timeout(config.idle_timeout, stream.next()) => {
@@ -191,7 +204,7 @@ where
                     Ok(Some(Ok(msg))) => {
                         heartbeat.reset();
                         if let Some(reason) =
-                            handle_frame::<H>(msg, hub, clients, connection_id, cancel, heartbeat_tx).await
+                            handle_frame::<H>(msg, hub, clients, connection_id, cancel, heartbeat_tx, &mut ping_sent_at).await
                         {
                             break reason;
                         }
@@ -199,10 +212,12 @@ where
                 }
             }
             _ = heartbeat.tick() => {
+                ping_sent_at = Some(Instant::now());
                 if heartbeat_tx.send(Message::Ping(axum::body::Bytes::new())).await.is_err() {
                     break "ping send error";
                 }
             }
+            _ = cancel.cancelled() => break "server disconnected",
         }
     }
 }
@@ -212,6 +227,9 @@ where
 /// Returns `Some(reason)` to signal that the connection should be closed, or `None` to continue
 /// the read loop. Data frames are decoded and dispatched to [`WsHub::on_message`] in a separate
 /// task that is cancelled when `cancel` fires.
+///
+/// `ping_sent_at` tracks when the most recent outgoing Ping was sent. It is cleared after a Pong
+/// is received and the RTT is recorded via [`WsClients::update_rtt`].
 async fn handle_frame<H>(
     msg: Message,
     hub: &Arc<H>,
@@ -219,6 +237,7 @@ async fn handle_frame<H>(
     connection_id: &Arc<str>,
     cancel: &CancellationToken,
     heartbeat_tx: &mpsc::Sender<Message>,
+    ping_sent_at: &mut Option<Instant>,
 ) -> Option<&'static str>
 where
     H: WsHub,
@@ -232,7 +251,14 @@ where
                 None
             }
         }
-        Message::Pong(_) => None,
+        Message::Pong(_) => {
+            if let Some(sent) = ping_sent_at.take() {
+                let rtt = sent.elapsed();
+                clients.update_rtt(connection_id, rtt).await;
+                tracing::debug!("RTT for {connection_id}: {rtt:?}");
+            }
+            None
+        }
         raw => match H::Codec::decode::<H::InMessage>(raw) {
             Err(e) => {
                 tracing::warn!("failed to parse message from {}: {e:?}", connection_id);

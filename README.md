@@ -138,6 +138,35 @@ async fn on_message(&self, msg: Self::InMessage, ctx: MessageContext<Self::OutMe
 }
 ```
 
+**Broadcast delivery policies** - control what happens when a client is too slow to consume messages:
+
+```rust
+use axum_signal::{BroadcastPolicy, InMemoryWsClients, JsonCodec};
+use std::time::Duration;
+
+let clients = InMemoryWsClients::<MyReply, JsonCodec>::new()
+    // Wait indefinitely — guarantees delivery, one slow client blocks the rest (default)
+    .with_policy(BroadcastPolicy::Block)
+
+    // Drop message after timeout, keep connection alive
+    .with_policy(BroadcastPolicy::DropMessage {
+        timeout: Duration::from_millis(100),
+    })
+
+    // Drop message after timeout, disconnect after N consecutive drops
+    .with_policy(BroadcastPolicy::DropConnection {
+        timeout: Duration::from_millis(100),
+        max_drops: 5,
+    })
+
+    // Optional: called on every dropped message — use for metrics
+    .with_on_drop(|connection_id| {
+        metrics::counter!("ws.dropped_messages").increment(1);
+    });
+```
+
+Applies to all multi-client operations: `broadcast_except`, `broadcast_group`, `broadcast_group_except`, `broadcast_groups`. Plain `broadcast` uses a `tokio::broadcast` channel and handles lagged receivers separately.
+
 **Default lifecycle hooks** - override only what you need:
 
 ```rust
@@ -154,6 +183,11 @@ impl WsHub for HelloHub {
     // optional - default logs connection id
     async fn on_disconnect(&self, req: DisconnectRequest) {
         tracing::info!("disconnected: {}", req.connection_id);
+    }
+
+    // optional - default logs a warning
+    async fn on_message_drop(&self, connection_id: Arc<str>) {
+        metrics::counter!("ws.dropped_messages").increment(1);
     }
 
     async fn on_message(&self, msg: Self::InMessage, ctx: MessageContext<Self::OutMessage, Self::Codec>) {

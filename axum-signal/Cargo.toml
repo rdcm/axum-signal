@@ -34,3 +34,7 @@ tracing-subscriber = { workspace = true }
 [[test]]
 name = "integration_tests"
 required-features = ["client"]
+
+[[test]]
+name = "policies_tests"
+required-features = ["client"]

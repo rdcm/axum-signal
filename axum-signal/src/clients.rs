@@ -1,10 +1,28 @@
 use axum::extract::ws::Message;
 use dashmap::{DashMap, DashSet};
 use futures::future::BoxFuture;
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
+use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 use crate::codec::WsCodec;
+use crate::policy::BroadcastPolicy;
+
+type OnDropFn = Arc<dyn Fn(Arc<str>) + Send + Sync>;
+
+/// Per-connection state tracked by [`InMemoryWsClients`].
+struct ConnectionState {
+    sender: mpsc::Sender<Message>,
+    cancel: CancellationToken,
+    on_drop: OnDropFn,
+    /// Number of consecutive dropped messages under the active [`BroadcastPolicy`].
+    drops: u32,
+    /// Rolling window of recent RTT samples (oldest first), used by [`BroadcastPolicy::DropOnHighRtt`].
+    rtt_samples: VecDeque<Duration>,
+}
 
 /// Manages the set of active WebSocket connections for a hub.
 ///
@@ -15,34 +33,36 @@ where
     M: serde::Serialize + Send + Sync + 'static,
     C: WsCodec,
 {
-    /// Registers a new connection with the given `connection_id` and outgoing message `sender`.
+    /// Registers a new connection.
     ///
-    /// The `sender` is an `mpsc` channel half that forwards encoded frames to the connection's
-    /// writer task.
-    fn add(&self, connection_id: Arc<str>, sender: mpsc::Sender<Message>) -> BoxFuture<'_, ()>;
+    /// `cancel` is the same token used by `serve` to shut down the connection's tasks;
+    /// [`BroadcastPolicy::DropConnection`] will cancel it to close the connection.
+    ///
+    /// `on_drop` is called whenever a message cannot be delivered to this connection due to the
+    /// active [`BroadcastPolicy`]. The connection id is passed as the argument.
+    fn add(
+        &self,
+        connection_id: Arc<str>,
+        sender: mpsc::Sender<Message>,
+        cancel: CancellationToken,
+        on_drop: Arc<dyn Fn(Arc<str>) + Send + Sync>,
+    ) -> BoxFuture<'_, ()>;
 
     /// Removes the connection identified by `connection_id` from the registry.
-    ///
-    /// After this call, unicast messages addressed to `connection_id` will be silently dropped.
     fn remove<'a>(&'a self, connection_id: &'a str) -> BoxFuture<'a, ()>;
 
     /// Returns a new [`broadcast::Receiver`] that will receive all future broadcast messages.
-    ///
-    /// Each connection should call this once during setup to avoid missing early broadcasts.
     fn subscribe(&self) -> broadcast::Receiver<Message>;
 
     /// Encodes `msg` and sends it only to the connection identified by `connection_id`.
-    ///
-    /// If the connection no longer exists or the channel is full the message is silently dropped.
     fn unicast<'a>(&'a self, connection_id: &'a str, msg: M) -> BoxFuture<'a, ()>;
 
     /// Encodes `msg` and delivers it to **all** currently subscribed connections in O(1).
-    ///
-    /// Uses the internal `broadcast` channel; receivers that lag beyond the channel capacity
-    /// will observe a [`broadcast::error::RecvError::Lagged`] error.
     fn broadcast(&self, msg: M) -> BoxFuture<'_, ()>;
 
     /// Encodes `msg` and sends it to all connections **except** those listed in `excluded`.
+    ///
+    /// Applies the active [`BroadcastPolicy`] for each recipient.
     fn broadcast_except<'a>(&'a self, excluded: &'a [&'a str], msg: M) -> BoxFuture<'a, ()>;
 
     /// Adds `connection_id` to the named `group`.
@@ -67,34 +87,51 @@ where
     ///
     /// Each connection receives the message at most once even if it belongs to multiple groups.
     fn broadcast_groups<'a>(&'a self, groups: &'a [&'a str], msg: M) -> BoxFuture<'a, ()>;
+
+    /// Records the latest RTT measurement for a connection.
+    ///
+    /// Called by the serve layer after each ping/pong exchange. Used by
+    /// [`BroadcastPolicy::DropOnHighRtt`] to gate delivery before sending.
+    fn update_rtt<'a>(&'a self, connection_id: &'a str, rtt: Duration) -> BoxFuture<'a, ()>;
 }
 
 /// In-memory implementation of [`WsClients`].
 ///
-/// Stores per-connection `mpsc` senders for unicast delivery and a single
-/// `broadcast` channel for fan-out delivery. Both channels hold pre-encoded
-/// [`Message`] values so encoding happens once regardless of the number of receivers.
+/// Stores per-connection [`ConnectionState`] for unicast delivery and a single
+/// `broadcast` channel for fan-out delivery.
+///
+/// # Configuration
+///
+/// Use the builder methods to customise delivery behaviour:
+///
+/// ```rust,no_run
+/// use axum_signal::{InMemoryWsClients, WsHubConfig, JsonCodec};
+///
+/// # #[derive(serde::Serialize)] struct MyMsg;
+/// let config = WsHubConfig::default();
+/// let clients = InMemoryWsClients::<MyMsg, JsonCodec>::new(
+///     config.policy,
+///     config.broadcast_channel_capacity,
+/// );
+/// ```
 pub struct InMemoryWsClients<M, C> {
-    // mpsc sender per connection — used for unicast
-    unicast_senders: DashMap<Arc<str>, mpsc::Sender<Message>>,
-    // single broadcast channel shared by all connections
+    connections: DashMap<Arc<str>, ConnectionState>,
     broadcast_tx: broadcast::Sender<Message>,
-    // group name -> set of connection ids
     group_members: DashMap<Arc<str>, DashSet<Arc<str>>>,
-    // connection id -> set of group names (reverse index for cleanup on disconnect)
     connection_groups: DashMap<Arc<str>, DashSet<Arc<str>>>,
+    policy: BroadcastPolicy,
     _phantom: std::marker::PhantomData<(M, C)>,
 }
 
-impl<M, C> Default for InMemoryWsClients<M, C> {
-    /// Creates an empty `InMemoryWsClients` with a broadcast channel capacity of 1024 messages.
-    fn default() -> Self {
-        let (broadcast_tx, _) = broadcast::channel(1024);
+impl<M, C> InMemoryWsClients<M, C> {
+    pub fn new(policy: BroadcastPolicy, broadcast_channel_capacity: usize) -> Self {
+        let (broadcast_tx, _) = broadcast::channel(broadcast_channel_capacity);
         Self {
-            unicast_senders: DashMap::new(),
+            connections: DashMap::new(),
             broadcast_tx,
             group_members: DashMap::new(),
             connection_groups: DashMap::new(),
+            policy,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -105,16 +142,27 @@ where
     M: serde::Serialize + Send + Sync + 'static,
     C: WsCodec,
 {
-    /// Inserts `sender` into the unicast map under `connection_id`.
-    fn add(&self, connection_id: Arc<str>, sender: mpsc::Sender<Message>) -> BoxFuture<'_, ()> {
+    fn add(
+        &self,
+        connection_id: Arc<str>,
+        sender: mpsc::Sender<Message>,
+        cancel: CancellationToken,
+        on_drop: Arc<dyn Fn(Arc<str>) + Send + Sync>,
+    ) -> BoxFuture<'_, ()> {
         Box::pin(async move {
-            self.unicast_senders.insert(connection_id, sender);
+            self.connections.insert(
+                connection_id,
+                ConnectionState {
+                    sender,
+                    cancel,
+                    on_drop,
+                    drops: 0,
+                    rtt_samples: VecDeque::new(),
+                },
+            );
         })
     }
 
-    /// Removes the entry for `connection_id` from the unicast map and all groups it belongs to.
-    ///
-    /// Groups that become empty after the removal are also dropped from `group_members`.
     fn remove<'a>(&'a self, connection_id: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             if let Some((_, groups)) = self.connection_groups.remove(connection_id) {
@@ -128,26 +176,22 @@ where
                     }
                 }
             }
-            self.unicast_senders.remove(connection_id);
+            self.connections.remove(connection_id);
         })
     }
 
-    /// Subscribes to the internal broadcast channel, returning a new receiver.
     fn subscribe(&self) -> broadcast::Receiver<Message> {
         self.broadcast_tx.subscribe()
     }
 
-    /// Encodes `msg` with codec `C` and sends the resulting frame to the connection
-    /// identified by `connection_id` via its `mpsc` sender.
-    ///
-    /// Encoding errors are logged at `error` level; missing or full channels are silently ignored.
     fn unicast<'a>(&'a self, connection_id: &'a str, msg: M) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             match C::encode(msg) {
                 Ok(ws_msg) => {
-                    // Clone the sender before dropping the DashMap guard — holding a DashMap Ref
-                    // across an `.await` keeps the shard's read lock live and causes contention.
-                    let sender = self.unicast_senders.get(connection_id).map(|r| r.clone());
+                    let sender = self
+                        .connections
+                        .get(connection_id)
+                        .map(|r| r.sender.clone());
                     if let Some(sender) = sender {
                         let _ = sender.send(ws_msg).await;
                     }
@@ -157,15 +201,10 @@ where
         })
     }
 
-    /// Encodes `msg` with codec `C` and publishes the resulting frame to the broadcast channel.
-    ///
-    /// This is an O(1) operation: the frame is sent once and all active receivers retrieve it
-    /// independently. Encoding errors are logged at `error` level.
     fn broadcast(&self, msg: M) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             match C::encode(msg) {
                 Ok(ws_msg) => {
-                    // O(1) — single send; all subscribers receive independently
                     let _ = self.broadcast_tx.send(ws_msg);
                 }
                 Err(e) => tracing::error!("encode error: {e}"),
@@ -177,14 +216,14 @@ where
         Box::pin(async move {
             match C::encode(msg) {
                 Ok(ws_msg) => {
-                    let senders: Vec<_> = self
-                        .unicast_senders
+                    let ids: Vec<Arc<str>> = self
+                        .connections
                         .iter()
                         .filter(|e| !excluded.contains(&e.key().as_ref()))
-                        .map(|e| e.value().clone())
+                        .map(|e| e.key().clone())
                         .collect();
-                    for sender in senders {
-                        let _ = sender.send(ws_msg.clone()).await;
+                    for id in ids {
+                        self.send_with_policy(&id, ws_msg.clone()).await;
                     }
                 }
                 Err(e) => tracing::error!("encode error: {e}"),
@@ -223,16 +262,12 @@ where
         Box::pin(async move {
             match C::encode(msg) {
                 Ok(ws_msg) => {
-                    let conn_ids: Vec<Arc<str>> = match self.group_members.get(group) {
+                    let ids: Vec<Arc<str>> = match self.group_members.get(group) {
                         Some(members) => members.iter().map(|id| id.clone()).collect(),
                         None => return,
                     };
-                    let senders: Vec<_> = conn_ids
-                        .iter()
-                        .filter_map(|id| self.unicast_senders.get(id.as_ref()).map(|s| s.clone()))
-                        .collect();
-                    for sender in senders {
-                        let _ = sender.send(ws_msg.clone()).await;
+                    for id in ids {
+                        self.send_with_policy(&id, ws_msg.clone()).await;
                     }
                 }
                 Err(e) => tracing::error!("encode error: {e}"),
@@ -249,7 +284,7 @@ where
         Box::pin(async move {
             match C::encode(msg) {
                 Ok(ws_msg) => {
-                    let conn_ids: Vec<Arc<str>> = match self.group_members.get(group) {
+                    let ids: Vec<Arc<str>> = match self.group_members.get(group) {
                         Some(members) => members
                             .iter()
                             .filter(|id| !excluded.contains(&id.as_ref()))
@@ -257,12 +292,8 @@ where
                             .collect(),
                         None => return,
                     };
-                    let senders: Vec<_> = conn_ids
-                        .iter()
-                        .filter_map(|id| self.unicast_senders.get(id.as_ref()).map(|s| s.clone()))
-                        .collect();
-                    for sender in senders {
-                        let _ = sender.send(ws_msg.clone()).await;
+                    for id in ids {
+                        self.send_with_policy(&id, ws_msg.clone()).await;
                     }
                 }
                 Err(e) => tracing::error!("encode error: {e}"),
@@ -276,26 +307,160 @@ where
                 Ok(ws_msg) => {
                     use std::collections::HashSet;
                     let mut seen: HashSet<Arc<str>> = HashSet::new();
-                    let mut senders: Vec<mpsc::Sender<Message>> = Vec::new();
+                    let mut ids: Vec<Arc<str>> = Vec::new();
                     for group in groups {
                         let conn_ids: Vec<Arc<str>> = match self.group_members.get(*group) {
                             Some(members) => members.iter().map(|id| id.clone()).collect(),
                             None => continue,
                         };
                         for id in conn_ids {
-                            if seen.insert(id.clone())
-                                && let Some(s) = self.unicast_senders.get(id.as_ref())
-                            {
-                                senders.push(s.clone());
+                            if seen.insert(id.clone()) {
+                                ids.push(id);
                             }
                         }
                     }
-                    for sender in senders {
-                        let _ = sender.send(ws_msg.clone()).await;
+                    for id in ids {
+                        self.send_with_policy(&id, ws_msg.clone()).await;
                     }
                 }
                 Err(e) => tracing::error!("encode error: {e}"),
             }
         })
+    }
+
+    fn update_rtt<'a>(&'a self, connection_id: &'a str, rtt: Duration) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let window = match &self.policy {
+                BroadcastPolicy::DropOnHighRtt { window, .. } => *window,
+                _ => return,
+            };
+            if let Some(mut state) = self.connections.get_mut(connection_id) {
+                if state.rtt_samples.len() == window {
+                    state.rtt_samples.pop_front();
+                }
+                state.rtt_samples.push_back(rtt);
+            }
+        })
+    }
+}
+
+impl<M, C> InMemoryWsClients<M, C>
+where
+    M: serde::Serialize + Send + Sync + 'static,
+    C: WsCodec,
+{
+    /// Delivers `msg` to the connection identified by `id` according to the active policy.
+    async fn send_with_policy(&self, id: &Arc<str>, msg: Message) {
+        match &self.policy {
+            BroadcastPolicy::Block => {
+                if let Some(state) = self.connections.get(id) {
+                    let sender = state.sender.clone();
+                    drop(state);
+                    let _ = sender.send(msg).await;
+                }
+            }
+            BroadcastPolicy::DropMessage { timeout: dur } => {
+                let (sender, on_drop) = match self.connections.get(id) {
+                    Some(s) => (s.sender.clone(), s.on_drop.clone()),
+                    None => return,
+                };
+                let dropped = timeout(*dur, sender.send(msg))
+                    .await
+                    .map_or(true, |r| r.is_err());
+                if dropped {
+                    on_drop(id.clone());
+                    tracing::warn!("message dropped for connection {id}");
+                }
+            }
+            BroadcastPolicy::DropConnection {
+                timeout: dur,
+                max_drops,
+            } => {
+                let (sender, on_drop) = match self.connections.get(id) {
+                    Some(s) => (s.sender.clone(), s.on_drop.clone()),
+                    None => return,
+                };
+                let dropped = timeout(*dur, sender.send(msg))
+                    .await
+                    .map_or(true, |r| r.is_err());
+                if dropped {
+                    on_drop(id.clone());
+                    tracing::warn!("message dropped for connection {id}");
+
+                    let should_disconnect = self
+                        .connections
+                        .get_mut(id)
+                        .map(|mut s| {
+                            s.drops += 1;
+                            s.drops >= *max_drops
+                        })
+                        .unwrap_or(false);
+
+                    if should_disconnect {
+                        tracing::info!(
+                            "disconnecting connection {id} after {} consecutive drops",
+                            max_drops
+                        );
+                        if let Some((_, state)) = self.connections.remove(id.as_ref()) {
+                            state.cancel.cancel();
+                        }
+                        // Clean up group membership
+                        if let Some((_, groups)) = self.connection_groups.remove(id.as_ref()) {
+                            for group in groups.iter() {
+                                if let Some(members) = self.group_members.get(group.as_ref()) {
+                                    members.remove(id.as_ref());
+                                    if members.is_empty() {
+                                        drop(members);
+                                        self.group_members.remove(group.as_ref());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(mut state) = self.connections.get_mut(id) {
+                    // Successful send resets the consecutive drop counter.
+                    state.drops = 0;
+                }
+            }
+            BroadcastPolicy::DropOnHighRtt { max_rtt, .. } => {
+                let (sender, on_drop, avg_rtt) = match self.connections.get(id) {
+                    Some(s) => {
+                        let avg = if s.rtt_samples.is_empty() {
+                            None
+                        } else {
+                            let sum: Duration = s.rtt_samples.iter().sum();
+                            Some(sum / s.rtt_samples.len() as u32)
+                        };
+                        (s.sender.clone(), s.on_drop.clone(), avg)
+                    }
+                    None => return,
+                };
+                // No samples yet — treat the connection as healthy.
+                if avg_rtt.is_some_and(|avg| avg > *max_rtt) {
+                    tracing::warn!(
+                        "dropping connection {id}: avg RTT {:?} exceeds max {:?}",
+                        avg_rtt.unwrap(),
+                        max_rtt
+                    );
+                    on_drop(id.clone());
+                    if let Some((_, state)) = self.connections.remove(id.as_ref()) {
+                        state.cancel.cancel();
+                    }
+                    if let Some((_, groups)) = self.connection_groups.remove(id.as_ref()) {
+                        for group in groups.iter() {
+                            if let Some(members) = self.group_members.get(group.as_ref()) {
+                                members.remove(id.as_ref());
+                                if members.is_empty() {
+                                    drop(members);
+                                    self.group_members.remove(group.as_ref());
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let _ = sender.send(msg).await;
+                }
+            }
+        }
     }
 }

@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use axum_signal::{HubClient, JsonCodec};
+use axum_signal::{BroadcastPolicy, HubClient, JsonCodec};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -9,6 +9,7 @@ use super::server::{TestCommand, TestReply, TestServer};
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long to wait when asserting that no message arrives.
+#[allow(dead_code)]
 const NO_MSG_GRACE: Duration = Duration::from_millis(150);
 
 /// System under test. Owns a [`TestServer`] and acts as a factory for [`TestClient`] connections.
@@ -20,7 +21,15 @@ impl Sut {
     pub async fn new() -> Result<Self> {
         let _ = tracing_subscriber::fmt::try_init();
         Ok(Self {
-            server: TestServer::start().await?,
+            server: TestServer::start_with_policy(BroadcastPolicy::Block).await?,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub async fn new_with_policy(policy: BroadcastPolicy) -> Result<Self> {
+        let _ = tracing_subscriber::fmt::try_init();
+        Ok(Self {
+            server: TestServer::start_with_policy(policy).await?,
         })
     }
 
@@ -64,6 +73,7 @@ impl TestClient {
     }
 
     /// Asserts that no message arrives within [`NO_MSG_GRACE`].
+    #[allow(dead_code)]
     pub async fn assert_no_message(&mut self) -> Result<()> {
         tokio::select! {
             msg = self.rx.recv() => anyhow::bail!("expected no message but received {:?}", msg),
@@ -72,12 +82,14 @@ impl TestClient {
     }
 
     /// Returns the server-assigned connection id for this client.
+    #[allow(dead_code)]
     pub async fn connection_id(&mut self) -> Result<String> {
         self.send(TestCommand::GetConnectionId)?;
         Ok(self.recv().await?.payload)
     }
 
     /// Adds this connection to `group` and waits for the server ack.
+    #[allow(dead_code)]
     pub async fn add_to_group(&mut self, group: &str) -> Result<()> {
         self.send(TestCommand::AddToGroup {
             group: group.into(),
@@ -87,6 +99,7 @@ impl TestClient {
     }
 
     /// Removes this connection from `group` and waits for the server ack.
+    #[allow(dead_code)]
     pub async fn remove_from_group(&mut self, group: &str) -> Result<()> {
         self.send(TestCommand::RemoveFromGroup {
             group: group.into(),
