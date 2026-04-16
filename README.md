@@ -57,18 +57,15 @@ impl WsHub for HelloHub {
 Wire it up in your Axum router:
 
 ```rust
-pub fn api_router(state: AppState) -> Router {
-    Router::new()
-        .merge(hello_router())
-        .with_state(state.clone())
-}
-
 pub fn hello_router() -> Router<AppState> {
     Router::new().route(
         "/ws",
         get(
             |ws: WebSocketUpgrade, State(state): State<AppState>| async move {
-                ws.on_upgrade(move |socket| serve_hub(socket, HelloHub::new(state)))
+                let config = WsHubConfig::default();
+                ws.on_upgrade(move |socket| async move {
+                    serve_hub(socket, HelloHub::new(state), &config).await
+                })
             },
         ),
     )
@@ -86,7 +83,10 @@ pub fn hello_router() -> Router<AppState> {
              Query(params): Query<WsQueryParams>| async move {
                 // Extractors are resolved here, before the upgrade.
                 // Pass the extracted data into the hub constructor.
-                ws.on_upgrade(move |socket| serve_hub(socket, HelloHub::new(state, params)))
+                let config = WsHubConfig::default();
+                ws.on_upgrade(move |socket| async move {
+                    serve_hub(socket, HelloHub::new(state, params), &config).await
+                })
             },
         ),
     )
@@ -141,31 +141,52 @@ async fn on_message(&self, msg: Self::InMessage, ctx: MessageContext<Self::OutMe
 **Broadcast delivery policies** - control what happens when a client is too slow to consume messages:
 
 ```rust
-use axum_signal::{BroadcastPolicy, InMemoryWsClients, JsonCodec};
+use axum_signal::{BroadcastPolicy, WsHubConfig};
 use std::time::Duration;
 
-let clients = InMemoryWsClients::<MyReply, JsonCodec>::new()
-    // Wait indefinitely — guarantees delivery, one slow client blocks the rest (default)
-    .with_policy(BroadcastPolicy::Block)
+// Wait indefinitely — guarantees delivery, one slow client blocks the rest (default)
+let config = WsHubConfig {
+    policy: BroadcastPolicy::Block,
+    ..WsHubConfig::default()
+};
 
-    // Drop message after timeout, keep connection alive
-    .with_policy(BroadcastPolicy::DropMessage {
+// Drop message after timeout, keep connection alive
+let config = WsHubConfig {
+    policy: BroadcastPolicy::DropMessage {
         timeout: Duration::from_millis(100),
-    })
+    },
+    ..WsHubConfig::default()
+};
 
-    // Drop message after timeout, disconnect after N consecutive drops
-    .with_policy(BroadcastPolicy::DropConnection {
+// Drop message after timeout, disconnect after N consecutive drops
+let config = WsHubConfig {
+    policy: BroadcastPolicy::DropConnection {
         timeout: Duration::from_millis(100),
         max_drops: 5,
-    })
+    },
+    ..WsHubConfig::default()
+};
 
-    // Optional: called on every dropped message — use for metrics
-    .with_on_drop(|connection_id| {
-        metrics::counter!("ws.dropped_messages").increment(1);
-    });
+// Disconnect if the rolling-average RTT over the last `window` heartbeats exceeds `max_rtt`.
+// Until the first pong arrives the connection is treated as healthy.
+let config = WsHubConfig {
+    policy: BroadcastPolicy::DropOnHighRtt {
+        max_rtt: Duration::from_millis(300),
+        window: 8,
+    },
+    ..WsHubConfig::default()
+};
 ```
 
 Applies to all multi-client operations: `broadcast_except`, `broadcast_group`, `broadcast_group_except`, `broadcast_groups`. Plain `broadcast` uses a `tokio::broadcast` channel and handles lagged receivers separately.
+
+Override `on_message_drop` to react to dropped messages — e.g. to increment a metric:
+
+```rust
+async fn on_message_drop(&self, connection_id: Arc<str>) {
+    metrics::counter!("ws.dropped_messages").increment(1);
+}
+```
 
 **Default lifecycle hooks** - override only what you need:
 
