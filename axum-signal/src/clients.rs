@@ -330,12 +330,12 @@ where
 
     fn update_rtt<'a>(&'a self, connection_id: &'a str, rtt: Duration) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let window = match &self.policy {
-                BroadcastPolicy::DropOnHighRtt { window, .. } => *window,
+            let capacity = match &self.policy {
+                BroadcastPolicy::DropOnHighRtt { rtt_samples, .. } => *rtt_samples,
                 _ => return,
             };
             if let Some(mut state) = self.connections.get_mut(connection_id) {
-                if state.rtt_samples.len() == window {
+                if state.rtt_samples.len() == capacity {
                     state.rtt_samples.pop_front();
                 }
                 state.rtt_samples.push_back(rtt);

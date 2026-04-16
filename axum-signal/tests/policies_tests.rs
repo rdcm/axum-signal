@@ -93,7 +93,7 @@ async fn drop_on_high_rtt_delivers_when_rtt_unknown() {
     // No RTT measured yet — connection should receive messages normally.
     let sut = PolicySut::new(DropOnHighRtt {
         max_rtt: Duration::from_millis(50),
-        window: 4,
+        rtt_samples: 4,
     });
     let mut c = sut.active("c1").await;
 
@@ -108,7 +108,7 @@ async fn drop_on_high_rtt_delivers_when_rtt_unknown() {
 async fn drop_on_high_rtt_delivers_when_rtt_within_limit() {
     let sut = PolicySut::new(DropOnHighRtt {
         max_rtt: Duration::from_millis(50),
-        window: 4,
+        rtt_samples: 4,
     });
     let mut c = sut.active("c1").await;
 
@@ -124,7 +124,7 @@ async fn drop_on_high_rtt_delivers_when_rtt_within_limit() {
 async fn drop_on_high_rtt_disconnects_when_rtt_exceeded() {
     let sut = PolicySut::new(DropOnHighRtt {
         max_rtt: Duration::from_millis(50),
-        window: 4,
+        rtt_samples: 4,
     });
     let fast = sut.active("fast").await;
     let mut slow = sut.active("slow").await;
@@ -145,7 +145,7 @@ async fn drop_on_high_rtt_disconnects_when_rtt_exceeded() {
 async fn drop_on_high_rtt_only_drops_high_rtt_connections() {
     let sut = PolicySut::new(DropOnHighRtt {
         max_rtt: Duration::from_millis(50),
-        window: 4,
+        rtt_samples: 4,
     });
     let mut ok = sut.active("ok").await;
     let high = sut.active("high").await;
@@ -163,10 +163,10 @@ async fn drop_on_high_rtt_only_drops_high_rtt_connections() {
 
 #[tokio::test]
 async fn drop_on_high_rtt_spike_does_not_drop_when_average_is_within_limit() {
-    // window=4, max=50ms. Three good samples (10ms) + one spike (150ms) → avg = 45ms < 50ms.
+    // rtt_samples=4, max=50ms. Three good samples (10ms) + one spike (150ms) → avg = 45ms < 50ms.
     let sut = PolicySut::new(DropOnHighRtt {
         max_rtt: Duration::from_millis(50),
-        window: 4,
+        rtt_samples: 4,
     });
     let mut c = sut.active("c1").await;
 
@@ -189,10 +189,10 @@ async fn drop_on_high_rtt_spike_does_not_drop_when_average_is_within_limit() {
 
 #[tokio::test]
 async fn drop_on_high_rtt_sustained_high_rtt_drops_connection() {
-    // window=4, max=50ms. All four samples above limit → avg = 100ms > 50ms.
+    // rtt_samples=4, max=50ms. All four samples above limit → avg = 100ms > 50ms.
     let sut = PolicySut::new(DropOnHighRtt {
         max_rtt: Duration::from_millis(50),
-        window: 4,
+        rtt_samples: 4,
     });
     let c = sut.active("c1").await;
 

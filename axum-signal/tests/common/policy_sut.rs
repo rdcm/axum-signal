@@ -83,7 +83,7 @@ impl PolicySut {
 
     /// Injects RTT samples directly, bypassing the ping/pong exchange.
     ///
-    /// Calls `update_rtt` once per element, so the rolling average stabilises after `window`
+    /// Calls `update_rtt` once per element, so the rolling average stabilises after `rtt_samples`
     /// calls. For tests that need a single decisive measurement, pass a slice with one value.
     pub async fn set_rtt(&self, id: &str, samples: &[Duration]) {
         for &rtt in samples {

@@ -172,7 +172,7 @@ let config = WsHubConfig {
 let config = WsHubConfig {
     policy: BroadcastPolicy::DropOnHighRtt {
         max_rtt: Duration::from_millis(300),
-        window: 8,
+        rtt_samples: 8,
     },
     ..WsHubConfig::default()
 };

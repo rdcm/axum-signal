@@ -36,32 +36,35 @@ pub enum BroadcastPolicy {
     ///
     /// The serve layer sends a WebSocket `Ping` frame every `heartbeat_interval` and records the
     /// elapsed time until the matching `Pong` arrives. Each measurement is appended to a
-    /// per-connection ring buffer; once it holds `window` samples the oldest is evicted on every
+    /// per-connection ring buffer; once it holds `rtt_samples` samples the oldest is evicted on every
     /// new arrival.
     ///
     /// ## Delivery decision
     ///
     /// Before each send the rolling average of all buffered samples is compared against
-    /// `max_rtt`. Until `window` samples have been collected the average is computed over
+    /// `max_rtt`. Until `rtt_samples` samples have been collected the average is computed over
     /// however many samples exist, so the policy becomes effective after the first pong.
     /// Before any pong is received the connection is treated as healthy and messages are
     /// delivered normally.
     ///
-    /// ## Choosing `window`
+    /// ## Choosing `rtt_samples`
     ///
-    /// `window` controls the trade-off between responsiveness and noise resistance:
+    /// `rtt_samples` controls the trade-off between responsiveness and noise resistance:
     ///
-    /// - **Small window (e.g. 3)** — reacts quickly to a sudden latency jump, but a single
+    /// - **Small rtt_samples (e.g. 3)** — reacts quickly to a sudden latency jump, but a single
     ///   delayed pong (e.g. caused by a GC pause on the client) can trigger a disconnect.
-    /// - **Large window (e.g. 16)** — tolerates transient spikes, but takes longer to act on a
+    /// - **Large rtt_samples (e.g. 16)** — tolerates transient spikes, but takes longer to act on a
     ///   genuinely degraded link.
     ///
-    /// With the default `heartbeat_interval` of 15 s, `window = 8` keeps ~2 minutes of history.
+    /// With the default `heartbeat_interval` of 15 s, `rtt_samples = 8` keeps ~2 minutes of history.
     /// A good starting point for most applications.
     ///
     /// ## On drop
     ///
     /// [`WsHub::on_message_drop`](crate::WsHub::on_message_drop) is called before the connection
     /// is removed, the same as [`DropConnection`].
-    DropOnHighRtt { max_rtt: Duration, window: usize },
+    DropOnHighRtt {
+        max_rtt: Duration,
+        rtt_samples: usize,
+    },
 }
