@@ -12,7 +12,7 @@ pub struct PolicySut {
 
 pub struct WsConnection {
     id: &'static str,
-    rx: mpsc::Receiver<Message>,
+    rx: mpsc::Receiver<Arc<Message>>,
     pub cancel: CancellationToken,
     drops: Arc<AtomicU32>,
     /// Number of pre-filled messages to drain before counting real ones.
@@ -54,7 +54,7 @@ impl PolicySut {
         let drops_for_cb = drops.clone();
         let (tx, rx) = mpsc::channel(capacity);
         for _ in 0..prefill {
-            tx.try_send(Message::text("")).unwrap();
+            tx.try_send(Arc::new(Message::text(""))).unwrap();
         }
         let cancel = CancellationToken::new();
         self.clients

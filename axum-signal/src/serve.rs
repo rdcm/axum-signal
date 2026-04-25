@@ -85,7 +85,7 @@ pub async fn serve_hub_with_clients<H, C>(
     let (sink, mut stream) = socket.split();
     let connection_id: Arc<str> = Uuid::new_v4().to_string().into();
 
-    let (unicast_tx, unicast_rx) = mpsc::channel::<Message>(config.unicast_channel_capacity);
+    let (unicast_tx, unicast_rx) = mpsc::channel::<Arc<Message>>(config.unicast_channel_capacity);
     let heartbeat_tx = unicast_tx.clone();
     let broadcast_rx = clients.subscribe();
     let cancel = CancellationToken::new();
@@ -140,7 +140,7 @@ pub async fn serve_hub_with_clients<H, C>(
 /// The task exits when `cancel` is triggered, either source closes, or a send error occurs.
 fn spawn_writer(
     mut sink: SplitSink<WebSocket, Message>,
-    mut unicast_rx: mpsc::Receiver<Message>,
+    mut unicast_rx: mpsc::Receiver<Arc<Message>>,
     mut broadcast_rx: broadcast::Receiver<Message>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
@@ -148,6 +148,7 @@ fn spawn_writer(
         loop {
             tokio::select! {
                 Some(msg) = unicast_rx.recv() => {
+                    let msg = Arc::try_unwrap(msg).unwrap_or_else(|a| (*a).clone());
                     if sink.send(msg).await.is_err() { break; }
                 }
                 result = broadcast_rx.recv() => {
@@ -180,7 +181,7 @@ async fn run_read_loop<H>(
     clients: &Arc<dyn WsClients<H::OutMessage, H::Codec>>,
     connection_id: &Arc<str>,
     cancel: &CancellationToken,
-    heartbeat_tx: &mpsc::Sender<Message>,
+    heartbeat_tx: &mpsc::Sender<Arc<Message>>,
     config: &WsHubConfig,
 ) -> &'static str
 where
@@ -213,7 +214,7 @@ where
             }
             _ = heartbeat.tick() => {
                 ping_sent_at = Some(Instant::now());
-                if heartbeat_tx.send(Message::Ping(axum::body::Bytes::new())).await.is_err() {
+                if heartbeat_tx.send(Arc::new(Message::Ping(axum::body::Bytes::new()))).await.is_err() {
                     break "ping send error";
                 }
             }
@@ -236,7 +237,7 @@ async fn handle_frame<H>(
     clients: &Arc<dyn WsClients<H::OutMessage, H::Codec>>,
     connection_id: &Arc<str>,
     cancel: &CancellationToken,
-    heartbeat_tx: &mpsc::Sender<Message>,
+    heartbeat_tx: &mpsc::Sender<Arc<Message>>,
     ping_sent_at: &mut Option<Instant>,
 ) -> Option<&'static str>
 where
@@ -245,7 +246,7 @@ where
     match msg {
         Message::Close(_) => Some("client closed"),
         Message::Ping(p) => {
-            if heartbeat_tx.send(Message::Pong(p)).await.is_err() {
+            if heartbeat_tx.send(Arc::new(Message::Pong(p))).await.is_err() {
                 Some("pong send error")
             } else {
                 None

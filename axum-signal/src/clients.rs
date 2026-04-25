@@ -26,7 +26,7 @@ type OnDropFn = Arc<dyn Fn(Arc<str>) + Send + Sync>;
 /// Per-connection state tracked by [`InMemoryWsClients`].
 struct ConnectionState {
     id: Arc<str>,
-    sender: mpsc::Sender<Message>,
+    sender: mpsc::Sender<Arc<Message>>,
     cancel: CancellationToken,
     on_drop: OnDropFn,
     /// Number of consecutive dropped messages under the active [`BroadcastPolicy`].
@@ -54,7 +54,7 @@ where
     fn add(
         &self,
         connection_id: Arc<str>,
-        sender: mpsc::Sender<Message>,
+        sender: mpsc::Sender<Arc<Message>>,
         cancel: CancellationToken,
         on_drop: Arc<dyn Fn(Arc<str>) + Send + Sync>,
     ) -> BoxFuture<'_, ()>;
@@ -156,7 +156,7 @@ where
     fn add(
         &self,
         connection_id: Arc<str>,
-        sender: mpsc::Sender<Message>,
+        sender: mpsc::Sender<Arc<Message>>,
         cancel: CancellationToken,
         on_drop: Arc<dyn Fn(Arc<str>) + Send + Sync>,
     ) -> BoxFuture<'_, ()> {
@@ -195,7 +195,7 @@ where
                         .get(connection_id)
                         .map(|s| s.sender.clone());
                     if let Some(sender) = sender {
-                        let _ = sender.send(ws_msg).await;
+                        let _ = sender.send(Arc::new(ws_msg)).await;
                     }
                 }
                 Err(e) => tracing::error!("encode error: {e}"),
@@ -218,6 +218,7 @@ where
         Box::pin(async move {
             match C::encode(msg) {
                 Ok(ws_msg) => {
+                    let arc_msg = Arc::new(ws_msg);
                     self.connections
                         .iter()
                         .filter(|e| !excluded.contains(&e.key().as_ref()))
@@ -225,10 +226,10 @@ where
                         .collect::<Vec<_>>()
                         .stream_iter()
                         .for_each(|s| {
-                        let msg = ws_msg.clone();
-                        async move { self.send_with_policy(&s, msg).await }
-                    })
-                    .await;
+                            let msg = Arc::clone(&arc_msg);
+                            async move { self.send_with_policy(&s, msg).await }
+                        })
+                        .await;
                 }
                 Err(e) => tracing::error!("encode error: {e}"),
             }
@@ -269,6 +270,7 @@ where
                     let Some(members) = self.group_members.get(group) else {
                         return;
                     };
+                    let arc_msg = Arc::new(ws_msg);
                     members
                         .iter()
                         .filter_map(|id| {
@@ -277,7 +279,7 @@ where
                         .collect::<Vec<_>>()
                         .stream_iter()
                         .for_each(|s| {
-                            let msg = ws_msg.clone();
+                            let msg = Arc::clone(&arc_msg);
                             async move { self.send_with_policy(&s, msg).await }
                         })
                         .await;
@@ -299,6 +301,7 @@ where
                     let Some(members) = self.group_members.get(group) else {
                         return;
                     };
+                    let arc_msg = Arc::new(ws_msg);
                     members
                         .iter()
                         .filter(|id| !excluded.contains(&id.as_ref()))
@@ -308,7 +311,7 @@ where
                         .collect::<Vec<_>>()
                         .stream_iter()
                         .for_each(|s| {
-                            let msg = ws_msg.clone();
+                            let msg = Arc::clone(&arc_msg);
                             async move { self.send_with_policy(&s, msg).await }
                         })
                         .await;
@@ -322,6 +325,7 @@ where
         Box::pin(async move {
             match C::encode(msg) {
                 Ok(ws_msg) => {
+                    let arc_msg = Arc::new(ws_msg);
                     let mut seen: HashSet<Arc<str>> = HashSet::new();
                     groups
                         .iter()
@@ -338,10 +342,10 @@ where
                         .collect::<Vec<_>>()
                         .stream_iter()
                         .for_each(|s| {
-                        let msg = ws_msg.clone();
-                        async move { self.send_with_policy(&s, msg).await }
-                    })
-                    .await;
+                            let msg = Arc::clone(&arc_msg);
+                            async move { self.send_with_policy(&s, msg).await }
+                        })
+                        .await;
                 }
                 Err(e) => tracing::error!("encode error: {e}"),
             }
@@ -375,7 +379,7 @@ where
     C: WsCodec,
 {
     /// Delivers `msg` to the connection according to the active policy.
-    async fn send_with_policy(&self, state: &ConnectionState, msg: Message) {
+    async fn send_with_policy(&self, state: &ConnectionState, msg: Arc<Message>) {
         match &self.policy {
             BroadcastPolicy::Block => {
                 let _ = state.sender.send(msg).await;
