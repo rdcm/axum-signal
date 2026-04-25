@@ -1,8 +1,10 @@
 use axum::extract::ws::Message;
 use dashmap::{DashMap, DashSet};
 use futures::future::BoxFuture;
-use std::collections::VecDeque;
-use std::sync::Arc;
+use futures::stream::{self, StreamExt};
+use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::timeout;
@@ -11,17 +13,26 @@ use tokio_util::sync::CancellationToken;
 use crate::codec::WsCodec;
 use crate::policy::BroadcastPolicy;
 
+trait IntoStream: IntoIterator + Sized {
+    fn stream_iter(self) -> stream::Iter<Self::IntoIter> {
+        stream::iter(self)
+    }
+}
+
+impl<T: IntoIterator> IntoStream for T {}
+
 type OnDropFn = Arc<dyn Fn(Arc<str>) + Send + Sync>;
 
 /// Per-connection state tracked by [`InMemoryWsClients`].
 struct ConnectionState {
+    id: Arc<str>,
     sender: mpsc::Sender<Message>,
     cancel: CancellationToken,
     on_drop: OnDropFn,
     /// Number of consecutive dropped messages under the active [`BroadcastPolicy`].
-    drops: u32,
+    drops: AtomicU32,
     /// Rolling window of recent RTT samples (oldest first), used by [`BroadcastPolicy::DropOnHighRtt`].
-    rtt_samples: VecDeque<Duration>,
+    rtt_samples: RwLock<VecDeque<Duration>>,
 }
 
 /// Manages the set of active WebSocket connections for a hub.
@@ -115,7 +126,7 @@ where
 /// );
 /// ```
 pub struct InMemoryWsClients<M, C> {
-    connections: DashMap<Arc<str>, ConnectionState>,
+    connections: DashMap<Arc<str>, Arc<ConnectionState>>,
     broadcast_tx: broadcast::Sender<Message>,
     group_members: DashMap<Arc<str>, DashSet<Arc<str>>>,
     connection_groups: DashMap<Arc<str>, DashSet<Arc<str>>>,
@@ -151,31 +162,22 @@ where
     ) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             self.connections.insert(
-                connection_id,
-                ConnectionState {
+                connection_id.clone(),
+                Arc::new(ConnectionState {
+                    id: connection_id,
                     sender,
                     cancel,
                     on_drop,
-                    drops: 0,
-                    rtt_samples: VecDeque::new(),
-                },
+                    drops: AtomicU32::new(0),
+                    rtt_samples: RwLock::new(VecDeque::new()),
+                }),
             );
         })
     }
 
     fn remove<'a>(&'a self, connection_id: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            if let Some((_, groups)) = self.connection_groups.remove(connection_id) {
-                for group in groups.iter() {
-                    if let Some(members) = self.group_members.get(group.as_ref()) {
-                        members.remove(connection_id);
-                        if members.is_empty() {
-                            drop(members);
-                            self.group_members.remove(group.as_ref());
-                        }
-                    }
-                }
-            }
+            self.cleanup_groups(connection_id);
             self.connections.remove(connection_id);
         })
     }
@@ -191,7 +193,7 @@ where
                     let sender = self
                         .connections
                         .get(connection_id)
-                        .map(|r| r.sender.clone());
+                        .map(|s| s.sender.clone());
                     if let Some(sender) = sender {
                         let _ = sender.send(ws_msg).await;
                     }
@@ -216,15 +218,17 @@ where
         Box::pin(async move {
             match C::encode(msg) {
                 Ok(ws_msg) => {
-                    let ids: Vec<Arc<str>> = self
-                        .connections
+                    self.connections
                         .iter()
                         .filter(|e| !excluded.contains(&e.key().as_ref()))
-                        .map(|e| e.key().clone())
-                        .collect();
-                    for id in ids {
-                        self.send_with_policy(&id, ws_msg.clone()).await;
-                    }
+                        .map(|e| e.value().clone())
+                        .collect::<Vec<_>>()
+                        .stream_iter()
+                        .for_each(|s| {
+                        let msg = ws_msg.clone();
+                        async move { self.send_with_policy(&s, msg).await }
+                    })
+                    .await;
                 }
                 Err(e) => tracing::error!("encode error: {e}"),
             }
@@ -262,13 +266,21 @@ where
         Box::pin(async move {
             match C::encode(msg) {
                 Ok(ws_msg) => {
-                    let ids: Vec<Arc<str>> = match self.group_members.get(group) {
-                        Some(members) => members.iter().map(|id| id.clone()).collect(),
-                        None => return,
+                    let Some(members) = self.group_members.get(group) else {
+                        return;
                     };
-                    for id in ids {
-                        self.send_with_policy(&id, ws_msg.clone()).await;
-                    }
+                    members
+                        .iter()
+                        .filter_map(|id| {
+                            self.connections.get(id.as_ref()).map(|s| s.value().clone())
+                        })
+                        .collect::<Vec<_>>()
+                        .stream_iter()
+                        .for_each(|s| {
+                            let msg = ws_msg.clone();
+                            async move { self.send_with_policy(&s, msg).await }
+                        })
+                        .await;
                 }
                 Err(e) => tracing::error!("encode error: {e}"),
             }
@@ -284,17 +296,22 @@ where
         Box::pin(async move {
             match C::encode(msg) {
                 Ok(ws_msg) => {
-                    let ids: Vec<Arc<str>> = match self.group_members.get(group) {
-                        Some(members) => members
-                            .iter()
-                            .filter(|id| !excluded.contains(&id.as_ref()))
-                            .map(|id| id.clone())
-                            .collect(),
-                        None => return,
+                    let Some(members) = self.group_members.get(group) else {
+                        return;
                     };
-                    for id in ids {
-                        self.send_with_policy(&id, ws_msg.clone()).await;
-                    }
+                    members
+                        .iter()
+                        .filter(|id| !excluded.contains(&id.as_ref()))
+                        .filter_map(|id| {
+                            self.connections.get(id.as_ref()).map(|s| s.value().clone())
+                        })
+                        .collect::<Vec<_>>()
+                        .stream_iter()
+                        .for_each(|s| {
+                            let msg = ws_msg.clone();
+                            async move { self.send_with_policy(&s, msg).await }
+                        })
+                        .await;
                 }
                 Err(e) => tracing::error!("encode error: {e}"),
             }
@@ -305,23 +322,26 @@ where
         Box::pin(async move {
             match C::encode(msg) {
                 Ok(ws_msg) => {
-                    use std::collections::HashSet;
                     let mut seen: HashSet<Arc<str>> = HashSet::new();
-                    let mut ids: Vec<Arc<str>> = Vec::new();
-                    for group in groups {
-                        let conn_ids: Vec<Arc<str>> = match self.group_members.get(*group) {
-                            Some(members) => members.iter().map(|id| id.clone()).collect(),
-                            None => continue,
-                        };
-                        for id in conn_ids {
-                            if seen.insert(id.clone()) {
-                                ids.push(id);
-                            }
-                        }
-                    }
-                    for id in ids {
-                        self.send_with_policy(&id, ws_msg.clone()).await;
-                    }
+                    groups
+                        .iter()
+                        .flat_map(|g| {
+                            self.group_members
+                                .get(*g)
+                                .map(|m| m.iter().map(|id| id.clone()).collect::<Vec<_>>())
+                                .unwrap_or_default()
+                        })
+                        .filter(|id| seen.insert(id.clone()))
+                        .filter_map(|id| {
+                            self.connections.get(id.as_ref()).map(|s| s.value().clone())
+                        })
+                        .collect::<Vec<_>>()
+                        .stream_iter()
+                        .for_each(|s| {
+                        let msg = ws_msg.clone();
+                        async move { self.send_with_policy(&s, msg).await }
+                    })
+                    .await;
                 }
                 Err(e) => tracing::error!("encode error: {e}"),
             }
@@ -334,11 +354,16 @@ where
                 BroadcastPolicy::DropOnHighRtt { rtt_samples, .. } => *rtt_samples,
                 _ => return,
             };
-            if let Some(mut state) = self.connections.get_mut(connection_id) {
-                if state.rtt_samples.len() == capacity {
-                    state.rtt_samples.pop_front();
+            let state = self
+                .connections
+                .get(connection_id)
+                .map(|s| s.value().clone());
+            if let Some(state) = state {
+                let mut samples = state.rtt_samples.write().unwrap();
+                if samples.len() == capacity {
+                    samples.pop_front();
                 }
-                state.rtt_samples.push_back(rtt);
+                samples.push_back(rtt);
             }
         })
     }
@@ -349,116 +374,86 @@ where
     M: serde::Serialize + Send + Sync + 'static,
     C: WsCodec,
 {
-    /// Delivers `msg` to the connection identified by `id` according to the active policy.
-    async fn send_with_policy(&self, id: &Arc<str>, msg: Message) {
+    /// Delivers `msg` to the connection according to the active policy.
+    async fn send_with_policy(&self, state: &ConnectionState, msg: Message) {
         match &self.policy {
             BroadcastPolicy::Block => {
-                if let Some(state) = self.connections.get(id) {
-                    let sender = state.sender.clone();
-                    drop(state);
-                    let _ = sender.send(msg).await;
-                }
+                let _ = state.sender.send(msg).await;
             }
             BroadcastPolicy::DropMessage { timeout: dur } => {
-                let (sender, on_drop) = match self.connections.get(id) {
-                    Some(s) => (s.sender.clone(), s.on_drop.clone()),
-                    None => return,
-                };
-                let dropped = timeout(*dur, sender.send(msg))
+                let dropped = timeout(*dur, state.sender.send(msg))
                     .await
                     .map_or(true, |r| r.is_err());
                 if dropped {
-                    on_drop(id.clone());
-                    tracing::warn!("message dropped for connection {id}");
+                    (state.on_drop)(state.id.clone());
+                    tracing::warn!("message dropped for connection {}", state.id);
                 }
             }
             BroadcastPolicy::DropConnection {
                 timeout: dur,
                 max_drops,
             } => {
-                let (sender, on_drop) = match self.connections.get(id) {
-                    Some(s) => (s.sender.clone(), s.on_drop.clone()),
-                    None => return,
-                };
-                let dropped = timeout(*dur, sender.send(msg))
+                let dropped = timeout(*dur, state.sender.send(msg))
                     .await
                     .map_or(true, |r| r.is_err());
                 if dropped {
-                    on_drop(id.clone());
-                    tracing::warn!("message dropped for connection {id}");
+                    (state.on_drop)(state.id.clone());
+                    tracing::warn!("message dropped for connection {}", state.id);
 
-                    let should_disconnect = self
-                        .connections
-                        .get_mut(id)
-                        .map(|mut s| {
-                            s.drops += 1;
-                            s.drops >= *max_drops
-                        })
-                        .unwrap_or(false);
-
-                    if should_disconnect {
+                    let drops = state.drops.fetch_add(1, Ordering::Relaxed) + 1;
+                    if drops >= *max_drops {
                         tracing::info!(
-                            "disconnecting connection {id} after {} consecutive drops",
+                            "disconnecting connection {} after {} consecutive drops",
+                            state.id,
                             max_drops
                         );
-                        if let Some((_, state)) = self.connections.remove(id.as_ref()) {
-                            state.cancel.cancel();
+                        if let Some((_, cs)) = self.connections.remove(state.id.as_ref()) {
+                            cs.cancel.cancel();
                         }
-                        // Clean up group membership
-                        if let Some((_, groups)) = self.connection_groups.remove(id.as_ref()) {
-                            for group in groups.iter() {
-                                if let Some(members) = self.group_members.get(group.as_ref()) {
-                                    members.remove(id.as_ref());
-                                    if members.is_empty() {
-                                        drop(members);
-                                        self.group_members.remove(group.as_ref());
-                                    }
-                                }
-                            }
-                        }
+                        self.cleanup_groups(&state.id);
                     }
-                } else if let Some(mut state) = self.connections.get_mut(id) {
-                    // Successful send resets the consecutive drop counter.
-                    state.drops = 0;
+                } else {
+                    state.drops.store(0, Ordering::Relaxed);
                 }
             }
             BroadcastPolicy::DropOnHighRtt { max_rtt, .. } => {
-                let (sender, on_drop, avg_rtt) = match self.connections.get(id) {
-                    Some(s) => {
-                        let avg = if s.rtt_samples.is_empty() {
-                            None
-                        } else {
-                            let sum: Duration = s.rtt_samples.iter().sum();
-                            Some(sum / s.rtt_samples.len() as u32)
-                        };
-                        (s.sender.clone(), s.on_drop.clone(), avg)
+                let avg_rtt = {
+                    let samples = state.rtt_samples.read().unwrap();
+                    if samples.is_empty() {
+                        None
+                    } else {
+                        let sum: Duration = samples.iter().sum();
+                        Some(sum / samples.len() as u32)
                     }
-                    None => return,
                 };
-                // No samples yet — treat the connection as healthy.
                 if avg_rtt.is_some_and(|avg| avg > *max_rtt) {
                     tracing::warn!(
-                        "dropping connection {id}: avg RTT {:?} exceeds max {:?}",
+                        "dropping connection {}: avg RTT {:?} exceeds max {:?}",
+                        state.id,
                         avg_rtt.unwrap(),
                         max_rtt
                     );
-                    on_drop(id.clone());
-                    if let Some((_, state)) = self.connections.remove(id.as_ref()) {
-                        state.cancel.cancel();
+                    (state.on_drop)(state.id.clone());
+                    if let Some((_, cs)) = self.connections.remove(state.id.as_ref()) {
+                        cs.cancel.cancel();
                     }
-                    if let Some((_, groups)) = self.connection_groups.remove(id.as_ref()) {
-                        for group in groups.iter() {
-                            if let Some(members) = self.group_members.get(group.as_ref()) {
-                                members.remove(id.as_ref());
-                                if members.is_empty() {
-                                    drop(members);
-                                    self.group_members.remove(group.as_ref());
-                                }
-                            }
-                        }
-                    }
+                    self.cleanup_groups(&state.id);
                 } else {
-                    let _ = sender.send(msg).await;
+                    let _ = state.sender.send(msg).await;
+                }
+            }
+        }
+    }
+
+    fn cleanup_groups(&self, connection_id: &str) {
+        if let Some((_, groups)) = self.connection_groups.remove(connection_id) {
+            for group in groups.iter() {
+                if let Some(members) = self.group_members.get(group.as_ref()) {
+                    members.remove(connection_id);
+                    if members.is_empty() {
+                        drop(members);
+                        self.group_members.remove(group.as_ref());
+                    }
                 }
             }
         }
